@@ -161,6 +161,8 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
         )
     console.print(s)
 
+    render_agent(st.get("agent") or {}, console)
+
     fd = Table(
         title=f"Feed ({st.get('depth_source')}, every {st.get('depth_interval_s')}s, rate-limit remaining {st.get('ratelimit_remaining')})",
         header_style="bold cyan",
@@ -186,6 +188,46 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
         console.print(f"[dim]dust accepted: {st['dust']}[/]")
 
 
+def render_agent(ag: dict[str, Any], console: Console) -> None:
+    if not ag or not ag.get("source"):
+        console.print(
+            "[dim]Agent: no decision yet (first cycle ~90 s after start, then every 30 min / on risk events).[/]"
+        )
+        return
+    src = ag.get("source")
+    color = {"llm": "green", "replay": "cyan", "fallback": "red"}.get(src, "white")
+    lines = [
+        f"[bold]stance[/] {ag.get('stance')} · source [{color}]{src}[/] · trigger {ag.get('trigger')} · "
+        f"{ag.get('age_min')} min ago · applied {ag.get('applied')} · llm_call #{ag.get('llm_call_id')}",
+        f"[bold]rationale[/] {ag.get('rationale')}",
+        f"risk multiplier: agent {ag.get('risk_multiplier')} → effective {ag.get('effective_risk_multiplier')} · "
+        f"paused {ag.get('pause_markets') or []} · active {ag.get('active_markets') or 'all'} · "
+        f"blocked for entries {ag.get('blocked_markets') or []}",
+    ]
+    base, final, raw = (
+        ag.get("baseline") or {},
+        ag.get("final") or {},
+        ag.get("agent_weights_raw") or {},
+    )
+    if base or final:
+        diffs = ", ".join(
+            f"{k}: baseline {base.get(k, '0')} / agent {raw.get(k, '–')} → final {final.get(k, '0')}"
+            for k in sorted(set(base) | set(final))
+        )
+        lines.append(f"weights: {diffs}")
+    if ag.get("watch_requests"):
+        lines.append(
+            "watch: "
+            + "; ".join(
+                f"{w['action']} {w['strategy']}@{w['timeframe']}m {w['market']} ({w['why']})"
+                for w in ag["watch_requests"]
+            )
+        )
+    if ag.get("notes"):
+        lines.append(f"[dim]clamped: {ag['notes']}[/]")
+    console.print(Panel("\n".join(lines), title="LLM agent", expand=False))
+
+
 def _ago(ts: Any) -> str:
     try:
         return f"{int(time.time() - float(ts))}s ago"
@@ -201,7 +243,7 @@ def human_in_the_loop(settings: Settings, console: Console) -> bool:
         render_status(st, live, console)
     else:
         console.print("[yellow]No backtest/shadow results found yet.[/]")
-    ans = console.input("Run/review backtest and shadowtest first? [Y/n] ").strip().lower()
+    ans = console.input("Run/review backtest and shadowtest first? \\[Y/n] ").strip().lower()
     review_first = ans in ("", "y", "yes")
     conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
     log_event(

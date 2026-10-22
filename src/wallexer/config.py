@@ -97,6 +97,18 @@ class LlmCfg(BaseModel):
     model: str = "gpt-5.4-mini"
     fallback_model: str = "gpt-5.4-mini"
     timeout_s: float = 30.0
+    # Answer from recorded llm_calls (same prompt hash) instead of calling the API.
+    replay: bool = False
+
+
+class AgentCfg(BaseModel):
+    enabled: bool = True
+    interval_min: float = 30
+    debounce_min: float = 5  # minimum gap between event-triggered cycles
+    dd_step_pct: float = 1.0  # each further step of total drawdown triggers a cycle
+    feed_error_threshold: int = 10  # feed events within 5 min that trigger a cycle
+    max_watch_books: int = 3
+    decision_ttl_min: float = 65  # a decision older than this no longer applies (fallback)
 
 
 class GuardrailsCfg(BaseModel):
@@ -229,6 +241,7 @@ class AppConfig(BaseModel):
     promotion: PromotionCfg = PromotionCfg()
     alloc: AllocCfg = AllocCfg()
     backtest: BacktestCfg = BacktestCfg()
+    agent: AgentCfg = AgentCfg()
 
     def path(self, rel: str) -> Path:
         """Resolve a config-relative path against the repo root."""

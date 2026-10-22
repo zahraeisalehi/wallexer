@@ -22,7 +22,6 @@ err_console = Console(stderr=True)
 app = typer.Typer(
     name="wallexer",
     help="Automated spot-trading engine + CLI for Wallex (wallex.ir).",
-    no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
 )
@@ -94,6 +93,9 @@ def engine_run(
     market: list[str] = typer.Option(
         None, "--market", help="Restrict to these markets (repeatable)."
     ),
+    replay: bool = typer.Option(
+        False, "--replay", help="LLM answers from recorded llm_calls only."
+    ),
 ) -> None:
     """Run the engine in the foreground (JSON logs to stdout). Used by hosting and by shadowtest/trade."""
     from wallexer.config import ConfigError, Mode
@@ -105,7 +107,10 @@ def engine_run(
     except ValueError:
         raise ConfigError(f"unknown mode {mode!r}: use shadow or trade") from None
     setup_logging(level=20, json=True)
-    asyncio.run(Engine(load_settings(), m, market or None).run())
+    settings = load_settings()
+    if replay:
+        settings.cfg.llm.replay = True
+    asyncio.run(Engine(settings, m, market or None).run())
 
 
 @app.command()
@@ -247,6 +252,23 @@ research_app = typer.Typer(help="Research studies (read-only, no orders).", no_a
 app.add_typer(research_app, name="research")
 
 
+@research_app.command("spread")
+@friendly
+def research_spread(
+    collect: bool = typer.Option(
+        False, "--collect", help="Collect books/trades (read-only) instead of analyzing."
+    ),
+    hours: float = typer.Option(4.0, "--hours", help="How long to collect."),
+) -> None:
+    """Spread-capture scan over all allowed markets: net edge after 2 maker fees, fills, drift."""
+    from wallexer.cli.backtest_cmds import run_spread_scan
+    from wallexer.logging import setup_logging
+
+    if collect:
+        setup_logging(level=20, json=True)
+    asyncio.run(run_spread_scan(load_settings(), console, collect, hours))
+
+
 @research_app.command("basis")
 @friendly
 def research_basis() -> None:
@@ -256,8 +278,196 @@ def research_basis() -> None:
     asyncio.run(run_basis_study(load_settings(), console))
 
 
+agent_app = typer.Typer(help="LLM agent.", no_args_is_help=True)
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command("now")
+@friendly
+def agent_now() -> None:
+    """Ask the running engine for an agent decision now (otherwise every 30 min / on risk events)."""
+    from wallexer.cli.engine_cmds import NOT_RUNNING, render_agent, sock
+    from wallexer.engine import control
+
+    try:
+        resp = control.send(sock(load_settings()), "agent_now", timeout=120)
+    except control.EngineNotRunning:
+        console.print(NOT_RUNNING)
+        raise typer.Exit(1) from None
+    if not resp.get("ok"):
+        console.print(f"[red]{resp.get('error')}[/]")
+        raise typer.Exit(1)
+    render_agent(resp["agent"] | {"applied": True}, console)
+
+
+@agent_app.command("replay")
+@friendly
+def agent_replay(
+    call_id: int = typer.Argument(..., help="llm_calls id of a recorded agent decision."),
+) -> None:
+    """Re-run a recorded agent prompt in replay mode; must reproduce the recorded decision offline."""
+    from wallexer.cli.agent_cmds import replay_call
+
+    if not asyncio.run(replay_call(load_settings(), console, call_id)):
+        raise typer.Exit(1)
+
+
+@app.command()
+@friendly
+def log(n: int = typer.Argument(None, help="Log entry id (default: all, paged).")) -> None:
+    """All logs (paged), or one entry in full."""
+    from wallexer.cli.logs import show_log
+
+    show_log(load_settings(), console, n)
+
+
+@app.command()
+@friendly
+def reason(n: int = typer.Argument(None, help="Decision id (default: overview).")) -> None:
+    """Static explanation: all transactions/algorithms, or one decision's numbers in full."""
+    from wallexer.cli.logs import show_reason
+
+    show_reason(load_settings(), console, n)
+
+
+@app.command("exp-reason")
+@friendly
+def exp_reason(n: int = typer.Argument(None, help="Decision id (default: latest).")) -> None:
+    """LLM explanation of `reason n` (anonymized; summary, why, risk, confidence)."""
+    from wallexer.cli.logs import exp_reason as run
+
+    asyncio.run(run(load_settings(), console, n))
+
+
+@app.command()
+@friendly
+def rslt(which: str = typer.Argument(..., help="backtest | shadowtest")) -> None:
+    """Summary of the latest backtest or shadowtest run."""
+    from wallexer.cli.results import rslt as run
+
+    if which not in ("backtest", "shadowtest"):
+        console.print("[red]usage:[/] wallexer rslt <backtest|shadowtest>")
+        raise typer.Exit(2)
+    run(load_settings(), console, which)
+
+
+@app.command()
+@friendly
+def export() -> None:
+    """Zip decisions, orders, fills, equity, allocations, llm_calls, reports, basis study, dust, config."""
+    from wallexer.cli.results import export as run
+
+    settings = load_settings()
+    basis_md = asyncio.run(_basis_markdown(settings))
+    run(settings, console, basis_md)
+
+
+async def _basis_markdown(settings) -> str | None:
+    from wallexer.exchange.client import WallexClient
+    from wallexer.research.basis_study import BASES, load_cycles, markdown, study
+    from wallexer.store.db import init_db
+
+    conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
+    try:
+        cycles, skew = load_cycles(
+            conn, ["USDTTMN"] + [f"{b}{q}" for b in BASES for q in ("TMN", "USDT")]
+        )
+    finally:
+        conn.close()
+    if not cycles:
+        return None
+    async with WallexClient(settings) as client:
+        fees = await client.fees()
+    ts = [min(s.ts for s in c.values()) for c in cycles]
+    return markdown(study(cycles, fees), len(cycles), (max(ts) - min(ts)) / 3600, skew)
+
+
+config_app = typer.Typer(help="Configuration.", no_args_is_help=True)
+app.add_typer(config_app, name="config")
+autoset_app = typer.Typer(help="LLM-suggested settings (never auto-applied).", no_args_is_help=True)
+app.add_typer(autoset_app, name="autoset")
+
+
+def _reload_engine() -> None:
+    from wallexer.cli.engine_cmds import sock
+    from wallexer.engine import control
+
+    try:
+        resp = control.send(sock(load_settings()), "reload")
+        console.print(f"engine: {resp}")
+    except control.EngineNotRunning:
+        console.print("[dim]engine not running: applies at next start[/]")
+
+
+@config_app.command("guardrail")
+@friendly
+def config_guardrail() -> None:
+    """Show guardrails with bounds; edit values interactively (validated); applied live."""
+    from wallexer.cli.results import config_guardrail as run
+
+    changes = run(load_settings(), console)
+    if changes:
+        console.print(f"[green]saved[/] {changes}")
+        _reload_engine()
+    else:
+        console.print("No changes.")
+
+
+@autoset_app.command("guardrail")
+@friendly
+def autoset_guardrail() -> None:
+    """LLM suggests guardrail values from current market stats; you accept all, some or none."""
+    from wallexer.cli.engine_cmds import get_status
+    from wallexer.cli.results import autoset_guardrail as run
+
+    settings = load_settings()
+    st, _live = get_status(settings)
+    stats = {
+        "feed": (st or {}).get("feed"),
+        "regime": (st or {}).get("regime"),
+        "drawdown_pct": (st or {}).get("drawdown_pct"),
+        "phase": (st or {}).get("phase"),
+    }
+    changes = asyncio.run(run(settings, console, stats))
+    if changes:
+        console.print(f"[green]accepted and saved[/] {changes}")
+        _reload_engine()
+    else:
+        console.print("Nothing applied.")
+
+
+@app.command()
+@friendly
+def change(
+    src: str = typer.Argument(..., metavar="FROM", help="backtest | shadowtest | trade"),
+    dst: str = typer.Argument(..., metavar="TO", help="backtest | shadowtest | trade"),
+) -> None:
+    """Switch modes (all 6 transitions); trade transitions ask for confirmation."""
+    from wallexer.cli.change import change as run
+
+    code = asyncio.run(run(load_settings(), console, src, dst))
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command()
+@friendly
+def watch() -> None:
+    """Live dashboard (Textual). `q` / Quit closes the view only; the engine keeps running."""
+    from wallexer.cli.watch import run_watch
+
+    run_watch(load_settings())
+
+
 def main() -> None:
+    import sys
+
     setup_logging()
+    if len(sys.argv) == 1:
+        from wallexer.cli.repl import run_repl
+
+        run_repl(app, console)
+        return
     app()
 
 

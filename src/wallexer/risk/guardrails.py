@@ -84,3 +84,22 @@ def clamp_weights(
     if total > 1:
         out = {k: v / total for k, v in out.items()}
     return out
+
+
+# (min, max) accepted by `config guardrail` / `autoset guardrail`. Bounds keep hand or LLM edits
+# inside a sane envelope (e.g. the hard drawdown stop can never be disabled).
+GUARDRAIL_BOUNDS: dict[str, tuple[float, float]] = {
+    "max_position_pct": (1, 30),
+    "max_exposure_pct": (0, 80),
+    "max_order_pct": (1, 20),
+    "stop_loss_atr_mult": (0.5, 5),
+    "stop_loss_max_pct": (0.3, 5),
+    "daily_dd_soft_pct": (0.5, 6),
+    "soft_stop_pause_min": (5, 240),
+    "total_dd_hard_pct": (1, 10),
+    "max_consecutive_losses": (1, 10),
+    "loss_cooldown_min": (5, 480),
+    "max_open_orders": (1, 20),
+    "flatten_no_entry_min": (60, 300),
+    "flatten_force_min": (20, 120),
+}

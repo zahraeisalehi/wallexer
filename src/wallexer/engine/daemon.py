@@ -23,6 +23,9 @@ from typing import Any
 
 import structlog
 
+from wallexer.agent.agent import Applied, anonymize_snapshot, apply_decision
+from wallexer.agent.agent import ask as agent_ask
+from wallexer.agent.client import LlmClient
 from wallexer.alloc import promotion
 from wallexer.alloc.allocator import Allocation, NullAgent, allocate
 from wallexer.alloc.regime import REGIME_TF, build_reference, classify
@@ -57,7 +60,7 @@ from wallexer.risk.flatten import plan_flatten
 from wallexer.risk.guardrails import Limits
 from wallexer.risk.schedule import Phase, phase
 from wallexer.store import repo
-from wallexer.store.db import event_sink, init_db, log_event
+from wallexer.store.db import dumps, event_sink, init_db, log_event, now_iso
 from wallexer.strategies.base import Strategy
 from wallexer.strategies.basis_tmn_usdt import BasisTmnUsdt
 from wallexer.strategies.mean_reversion import MeanReversion
@@ -91,7 +94,17 @@ class Engine:
         self.hard_stopped = False
         self.soft_until = 0.0
         self.risk_multiplier = Decimal(1)
-        self.paused: set[str] = set()
+        self.paused: set[str] = set()  # human `stop` pauses
+        # LLM agent state (all effects shrink-only; see agent/agent.py)
+        self.agent_applied: Applied | None = None
+        self.agent_applied_ts = 0.0
+        self.agent_state: dict[str, Any] = {}
+        self.agent_last_run = 0.0
+        self.agent_reason = "interval"
+        self.agent_event: asyncio.Event | None = None
+        self.last_dd_step = 0
+        self.watch_books: dict[str, tuple[str, int, str, Any, PaperBook]] = {}
+        self.recheck_requests: list[tuple[str, int, str]] = []
         self.peak_equity = cfg.account.expected_equity_tmn
         self.day = datetime.now(UTC).date()
         self.day_start_equity = cfg.account.expected_equity_tmn
@@ -212,6 +225,7 @@ class Engine:
             | {"selected": {n: v.get("update") for n, v in self.wf["strategies"].items()}},
         )
         self.books = {x.name: self._new_book(x.name, "shadow") for x in self.strategies}
+        self.llm = LlmClient(s, self.conn)
         # account / executor from exchange truth
         bals = await self.client.balances()
         start = {a: b.value for a, b in bals.items() if b.value > 0}
@@ -314,6 +328,27 @@ class Engine:
                 out[sym] = qty * px
         return out
 
+    def _agent_fresh(self) -> bool:
+        ttl = self.settings.cfg.agent.decision_ttl_min * 60
+        return self.agent_applied is not None and time.time() - self.agent_applied_ts <= ttl
+
+    def _effective_risk_multiplier(self) -> Decimal:
+        """min(engine soft-stop multiplier, agent multiplier): the agent can only lower it."""
+        if self._agent_fresh():
+            assert self.agent_applied is not None
+            return min(self.risk_multiplier, self.agent_applied.risk_multiplier)
+        return self.risk_multiplier
+
+    def _blocked_markets(self) -> frozenset[str]:
+        """No new entries: human pauses + agent pauses + markets outside the agent's active set."""
+        blocked = set(self.paused)
+        if self._agent_fresh():
+            assert self.agent_applied is not None
+            blocked |= self.agent_applied.agent_paused
+            if self.agent_applied.active_markets is not None:
+                blocked |= set(self.symbols) - self.agent_applied.active_markets
+        return frozenset(blocked)
+
     def _risk_state(self, now: float) -> gate.RiskState:
         held = {
             sym: self.account.free.get(r.base_asset, ZERO)
@@ -332,7 +367,7 @@ class Engine:
             event_end=self.event_end,
             hard_stopped=self.hard_stopped,
             soft_stop_until=self.soft_until,
-            paused=frozenset(self.paused),
+            paused=self._blocked_markets(),
         )
 
     # ================================================================== tick
@@ -357,6 +392,7 @@ class Engine:
                 continue
             for t in book.step(sigs, sf, now, trades=trades):
                 repo.insert_paper_trade(self.conn, t, self.run_id)
+        self._tick_watch_books(now, trades)
         await self.executor.on_market(self.feed.books, trades, now)
         if isinstance(self.executor, ShadowExecutor):
             self.account = await self.executor.snapshot()
@@ -377,9 +413,14 @@ class Engine:
         self.peak_equity = max(self.peak_equity, self.equity)
         st = self._risk_state(now)
         total_dd, daily_dd = gate.drawdowns(st)
+        step = int(total_dd / Decimal(str(self.settings.cfg.agent.dd_step_pct)))
+        if step > self.last_dd_step:
+            self.last_dd_step = step
+            self.trigger_agent(f"drawdown_step:{total_dd:.2f}%")
         if not self.hard_stopped and total_dd >= g.total_dd_hard_pct:
             self.hard_stopped = True
             self.flatten_requested = set()
+            self.trigger_agent("risk.hard_stop")
             log_event(
                 self.conn,
                 "risk.hard_stop",
@@ -394,6 +435,7 @@ class Engine:
             self.soft_until = now + g.soft_stop_pause_min * 60
             self.risk_multiplier = Decimal("0.5")
             log_event(self.conn, "risk.soft_stop", {"daily_drawdown_pct": f"{daily_dd:.2f}"})
+            self.trigger_agent("risk.soft_stop")
         p = phase(now, self.event_end, g.flatten_no_entry_min * 60, g.flatten_force_min * 60)
         if (
             p in (Phase.flatten, Phase.ended)
@@ -463,7 +505,7 @@ class Engine:
             r = self.all_rules.get(sym)
             if m is None or r is None or sym in busy or not m.book_ok:
                 continue
-            tgt = targets.get(sym, ZERO) * self.equity * self.risk_multiplier
+            tgt = targets.get(sym, ZERO) * self.equity * self._effective_risk_multiplier()
             cur = positions.get(sym, ZERO)
             delta = tgt - cur
             px_tmn = self._price_tmn(r.base_asset) or ZERO
@@ -713,6 +755,7 @@ class Engine:
                     },
                     reason=st.reason,
                 )
+                self.trigger_agent(f"{'promotion' if st.promoted else 'demotion'}:{strat.name}")
             self.statuses[strat.name] = st
 
     async def allocate_once(self) -> None:
@@ -741,16 +784,41 @@ class Engine:
             snapshot,
         )
         a = self.allocation
-        repo.insert_allocation(
-            self.conn,
-            run_id=self.run_id,
-            source=a.source,
-            baseline={k: str(v) for k, v in a.baseline.items()}
-            | {"_scores": a.scores, "_regime": self.regime},
-            agent=None if a.agent is None else {k: str(v) for k, v in a.agent.items()},
-            final={k: str(v) for k, v in a.final.items()},
+        # The agent's (already shrink-only) weights replace the baseline while its decision is
+        # fresh; re-clamped here because promotions may have changed since it was made.
+        source = "baseline"
+        agent_w = None
+        if self._agent_fresh():
+            assert self.agent_applied is not None
+            agent_w = self.agent_applied.weights
+            promoted = {n for n, st in self.statuses.items() if st.promoted}
+            final = {n: (agent_w.get(n, ZERO) if n in promoted else ZERO) for n in a.baseline}
+            source = "agent"
+        else:
+            final = dict(a.baseline)
+            if self.agent_state.get("source") == "fallback":
+                source = "fallback"
+        self.allocation = Allocation(a.baseline, agent_w, final, source, a.scores)
+        a = self.allocation
+        self.conn.execute(
+            "INSERT INTO allocations (ts, run_id, baseline, agent, final, source, llm_call_id)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                now_iso(),
+                self.run_id,
+                dumps(
+                    {k: str(v) for k, v in a.baseline.items()}
+                    | {"_scores": a.scores, "_regime": self.regime}
+                ),
+                None if a.agent is None else dumps({k: str(v) for k, v in a.agent.items()}),
+                dumps({k: str(v) for k, v in a.final.items()}),
+                a.source,
+                self.agent_state.get("llm_call_id") if source == "agent" else None,
+            ),
         )
-        for n, b in self.books.items():
+        self._feed_error_trigger()
+        books_all = {**self.books, **{n: w[4] for n, w in self.watch_books.items()}}
+        for n, b in books_all.items():
             eq = b.equity(f)
             repo.insert_paper_equity(
                 self.conn,
@@ -775,6 +843,201 @@ class Engine:
             else ZERO,
         )
         await self._usdt_inventory(f)
+
+    # ================================================================== LLM agent
+
+    def trigger_agent(self, reason: str) -> None:
+        self.agent_reason = reason
+        if self.agent_event is not None:
+            self.agent_event.set()
+
+    def _feed_error_trigger(self) -> None:
+        since = datetime.fromtimestamp(time.time() - 300, UTC).isoformat(timespec="milliseconds")
+        n = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE ts >= ? AND kind LIKE 'feed.%'", (since,)
+        ).fetchone()[0]
+        if n >= self.settings.cfg.agent.feed_error_threshold:
+            self.trigger_agent(f"feed_errors:{n}/5min")
+
+    def agent_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        f15 = self.features(now, REGIME_TF, self.strategy_cfg["momentum"])
+        vol = {s: m.vol_bps for s, m in f15.markets.items() if m.vol_bps is not None}
+        hours = None if self.event_end is None else (self.event_end - now) / 3600
+        return anonymize_snapshot(
+            self.snapshot(),
+            vol_15m_bps=vol,
+            allowed_markets=self.symbols,
+            hours_to_end=hours,
+            capital=self.settings.cfg.account.expected_equity_tmn,
+        )
+
+    async def agent_cycle(self, reason: str) -> dict[str, Any]:
+        """One agent decision: snapshot -> LLM -> validate -> apply shrink-only -> log everything."""
+        cfg = self.settings.cfg
+        self.agent_last_run = time.time()
+        snap = self.agent_snapshot()
+        res = await agent_ask(self.llm, snap)
+        before = {
+            "risk_multiplier": str(self._effective_risk_multiplier()),
+            "blocked_markets": sorted(self._blocked_markets()),
+            "weights": {
+                k: str(v) for k, v in (self.allocation.final if self.allocation else {}).items()
+            },
+            "watch_books": sorted(self.watch_books),
+        }
+        if res.parsed is None:
+            self.agent_state = {
+                "ts": time.time(),
+                "source": "fallback",
+                "trigger": reason,
+                "error": res.error,
+                "llm_call_id": res.llm_call_id,
+                "stance": self.agent_state.get("stance"),
+                "rationale": f"fallback to baseline ({res.error})",
+            }
+            repo.record_decision(
+                self.conn,
+                mode=self.mode.value,
+                run_id=self.run_id,
+                action="agent_fallback",
+                signal={
+                    "trigger": reason,
+                    "prompt_hash": res.prompt_hash,
+                    "llm_call_id": res.llm_call_id,
+                },
+                risk_checks={"before": before},
+                reason=f"LLM unavailable/invalid: {res.error}",
+            )
+            return self.agent_state
+        d = res.parsed
+        promoted = [n for n, st in self.statuses.items() if st.promoted]
+        applied = apply_decision(
+            d,
+            promoted=promoted,
+            paper_only=cfg.promotion.paper_only,
+            max_weight=cfg.alloc.max_strategy_weight,
+            engine_risk_multiplier=self.risk_multiplier,
+            universe=self.symbols,
+            max_watch_books=cfg.agent.max_watch_books,
+        )
+        self.agent_applied, self.agent_applied_ts = applied, time.time()
+        self._apply_watch(applied)
+        after = {
+            "risk_multiplier": str(self._effective_risk_multiplier()),
+            "blocked_markets": sorted(self._blocked_markets()),
+            "weights": {k: str(v) for k, v in applied.weights.items()},
+            "watch_books": sorted(self.watch_books),
+            "recheck": [list(x) for x in applied.watch_recheck],
+            "notes": applied.notes,
+        }
+        baseline = {
+            k: str(v) for k, v in (self.allocation.baseline if self.allocation else {}).items()
+        }
+        self.agent_state = {
+            "ts": time.time(),
+            "source": res.source,
+            "trigger": reason,
+            "llm_call_id": res.llm_call_id,
+            "stance": d.stance,
+            "rationale": d.rationale,
+            "risk_multiplier": d.risk_multiplier,
+            "pause_markets": sorted(applied.agent_paused),
+            "active_markets": None
+            if applied.active_markets is None
+            else sorted(applied.active_markets),
+            "watch_requests": [w.model_dump() for w in d.watch_requests],
+            "agent_weights_raw": d.strategy_weights.model_dump(),
+            "baseline": baseline,
+            "final": after["weights"],
+            "notes": applied.notes,
+        }
+        repo.record_decision(
+            self.conn,
+            mode=self.mode.value,
+            run_id=self.run_id,
+            action="agent_decision",
+            signal={
+                "trigger": reason,
+                "prompt_hash": res.prompt_hash,
+                "llm_call_id": res.llm_call_id,
+                "source": res.source,
+                "decision": d.model_dump(),
+            },
+            weights={
+                "baseline": baseline,
+                "agent_raw": d.strategy_weights.model_dump(),
+                "final": after["weights"],
+            },
+            risk_checks={"before": before, "after": after},
+            reason=d.rationale,
+        )
+        for key in applied.watch_recheck:
+            log_event(
+                self.conn,
+                "agent.recheck_request",
+                {"strategy": key[0], "timeframe": key[1], "market": key[2]},
+            )
+        return self.agent_state
+
+    def _apply_watch(self, applied: Applied) -> None:
+        """Extra shadow paper books for the agent's 'paper' watch requests (max N, oldest dropped)."""
+        cfg = self.settings.cfg
+        for strat_name, tf, market in applied.watch_paper:
+            name = f"{strat_name}@{tf}m:{market}"
+            if name in self.watch_books:
+                continue
+            if len(self.watch_books) >= cfg.agent.max_watch_books:
+                oldest = next(iter(self.watch_books))
+                del self.watch_books[oldest]
+                log_event(self.conn, "agent.watch_book_dropped", {"name": oldest})
+            base = self.strategy_cfg[strat_name]
+            wcfg = base.model_copy(update={"timeframe": tf, "quotes": []})
+            g = cfg.guardrails
+            obj = MeanReversion(wcfg, g) if strat_name == "mean_reversion" else Momentum(wcfg, g)
+            book = self._new_book(name, "watch")
+            self.watch_books[name] = (strat_name, tf, market, obj, book)
+            log_event(self.conn, "agent.watch_book_started", {"name": name})
+
+    def _tick_watch_books(self, now: float, trades: dict[str, Any]) -> None:
+        for name, (_s, tf, market, obj, book) in list(self.watch_books.items()):
+            cfg = obj.cfg
+            full = self.features(now, tf, cfg)
+            keep = {k: v for k, v in full.markets.items() if k in (market, "USDTTMN")}
+            f = Features(now, keep, {}, full.usdt_tmn_bid)
+            try:
+                sigs = [x for x in obj.on_tick(f, book.view(), now) if x.market == market]
+            except Exception as e:
+                self.errors += 1
+                log.exception("watch.error", name=name, error=str(e))
+                continue
+            for t in book.step(sigs, f, now, trades=trades):
+                repo.insert_paper_trade(self.conn, t, self.run_id)
+
+    async def _agent_loop(self) -> None:
+        acfg = self.settings.cfg.agent
+        assert self.agent_event is not None
+        while not self.stopping.is_set():
+            wait = max(1.0, self.agent_last_run + acfg.interval_min * 60 - time.time())
+            triggered = False
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.agent_event.wait(), timeout=wait)
+                triggered = True
+            if self.stopping.is_set():
+                return
+            if triggered:
+                self.agent_event.clear()
+                gap = time.time() - self.agent_last_run
+                if gap < acfg.debounce_min * 60:
+                    await asyncio.sleep(acfg.debounce_min * 60 - gap)
+            reason = self.agent_reason if triggered else "interval"
+            self.agent_reason = "interval"
+            try:
+                await self.agent_cycle(reason)
+            except Exception as e:  # the agent must never take the engine down
+                self.errors += 1
+                log.exception("agent.error", error=str(e)[:200])
+                log_event(self.conn, "agent.error", {"error": str(e)[:300]})
 
     def _usdt_strategy_stats(self, f: Features) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
         exposure, per_cycle = {}, {}
@@ -903,6 +1166,26 @@ class Engine:
                     "pending_maker": sorted(b.pending),
                 }
             )
+        from wallexer.alloc.promotion import stats as _stats
+
+        for name, (_s, tf, market, _obj, book) in self.watch_books.items():
+            strategies.append(
+                {
+                    "name": name,
+                    "watch": True,
+                    "promoted": False,
+                    "paper_only": True,
+                    "status": "agent watch book (paper)",
+                    "reason": f"requested by agent on {market}",
+                    "timeframe": tf,
+                    "oos": {},
+                    "shadow": _stats(book.closed).as_dict(),
+                    "weight": "0",
+                    "paper_equity": f"{book.equity(f):.0f}" if f else "–",
+                    "open_paper_positions": sorted(book.lots),
+                    "pending_maker": sorted(book.pending),
+                }
+            )
         promoted_any = any(s["promoted"] for s in strategies)
         positions = {k: f"{v:.0f}" for k, v in self._positions_tmn().items()}
         usdt_qty = self.account.total("USDT")
@@ -941,6 +1224,15 @@ class Engine:
             "flat_by_design": not promoted_any and not positions,
             "strategies": strategies,
             "allocation_source": self.allocation.source if self.allocation else None,
+            "agent": {
+                **{k: v for k, v in self.agent_state.items() if k != "ts"},
+                "age_min": round((time.time() - self.agent_state["ts"]) / 60, 1)
+                if self.agent_state.get("ts")
+                else None,
+                "applied": self._agent_fresh(),
+                "effective_risk_multiplier": str(self._effective_risk_multiplier()),
+                "blocked_markets": sorted(self._blocked_markets()),
+            },
             "regime": self.regime,
             "usdt_inventory": {
                 "qty": str(usdt_qty),
@@ -999,6 +1291,28 @@ class Engine:
     async def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         cmd = req.get("cmd")
         markets = {m.upper() for m in req.get("markets") or []}
+        if cmd == "agent_now":
+            if not self.settings.cfg.agent.enabled:
+                return {"ok": False, "error": "agent disabled in config"}
+            state = await self.agent_cycle("manual")
+            return {"ok": True, "agent": state}
+        if cmd == "reload":
+            from wallexer.config import load_settings
+
+            fresh = load_settings()
+            self.settings.cfg.guardrails = fresh.cfg.guardrails
+            self.limits = Limits.from_settings(
+                self.settings,
+                forbidden=self.forbidden,
+                unavailable=self.unavailable,
+                limit_only=self.universe.limit_only,
+            )
+            log_event(
+                self.conn,
+                "control.reload",
+                {"guardrails": fresh.cfg.guardrails.model_dump(mode="json")},
+            )
+            return {"ok": True, "reloaded": "guardrails"}
         if cmd == "ping":
             return {"ok": True, "mode": self.mode.value}
         if cmd == "status":
@@ -1077,6 +1391,11 @@ class Engine:
                     self._every(ecfg.reconcile_interval_s, self._reconcile, "reconcile")
                 ),
             ]
+            if self.settings.cfg.agent.enabled:
+                self.agent_event = asyncio.Event()
+                # first decision ~90 s after start, once promotions/regime/allocation exist
+                self.agent_last_run = time.time() - self.settings.cfg.agent.interval_min * 60 + 90
+                tasks.append(asyncio.create_task(self._agent_loop()))
             await self.stopping.wait()
             for t in tasks:
                 t.cancel()
@@ -1098,6 +1417,8 @@ class Engine:
         if hasattr(self, "feed"):
             self._write_status_file()
         log_event(self.conn, "engine.stopped", {"run_id": self.run_id})
+        if hasattr(self, "llm"):
+            await self.llm.close()
         await self.client.aclose()
         self.conn.close()
 

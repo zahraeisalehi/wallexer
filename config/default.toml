@@ -70,6 +70,17 @@ base_url = "https://ai.boxapi.ir/ai/v1"
 model = "gpt-5.4-mini"
 fallback_model = "gpt-5.4-mini"
 timeout_s = 30.0
+# true = answer from recorded llm_calls (same prompt hash); no API call (reproducible runs)
+replay = false
+
+[agent]
+enabled = true
+interval_min = 30
+debounce_min = 5
+dd_step_pct = 1.0
+feed_error_threshold = 10
+max_watch_books = 3
+decision_ttl_min = 65
 
 [guardrails]
 max_position_pct = "20"
