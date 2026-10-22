@@ -27,6 +27,9 @@ class Position:
     entry_ts: float
     stop: Decimal
     peak: Decimal  # highest bid seen since entry (for trailing exits)
+    entry_dev: float = (
+        0.0  # mean_reversion: VWAP - entry price at entry (fixed for the exit target)
+    )
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,7 @@ class Signal:
     reason: dict[str, Any]
     stop: Decimal | None = None
     legs: tuple[tuple[str, Side], ...] = field(default=())  # cycle legs, in execution order
+    entry_dev: float | None = None  # carried into Position.entry_dev
 
 
 class Strategy(Protocol):
@@ -66,6 +70,10 @@ def stop_price(m: MarketFeatures, entry_px: Decimal, atr_mult: float, max_pct: D
     else:
         frac = max_frac
     return entry_px * (1 - frac)
+
+
+def in_scope(quote: str, quotes: list[str]) -> bool:
+    return not quotes or quote in quotes
 
 
 def cooled_down(book: BookView, market: str, now: float, minutes: int) -> bool:

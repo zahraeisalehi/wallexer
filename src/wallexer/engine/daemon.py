@@ -25,14 +25,15 @@ import structlog
 
 from wallexer.alloc import promotion
 from wallexer.alloc.allocator import Allocation, NullAgent, allocate
-from wallexer.alloc.regime import classify
+from wallexer.alloc.regime import REGIME_TF, build_reference, classify
 from wallexer.alloc.usdt_inventory import decide as usdt_decide
 from wallexer.alloc.usdt_inventory import target_frac as usdt_target
+from wallexer.backtest.report import latest_run, stats_from_json
 from wallexer.config import ConfigError, Mode, Settings
 from wallexer.data.features import Features, basis_features, imbalance, market_features
 from wallexer.data.feed import MarketFeed
+from wallexer.data.history import load_bars, sync_history
 from wallexer.engine import control, health
-from wallexer.engine.replay import replay
 from wallexer.exchange.account import CreditCheck, PreflightError, preflight_live
 from wallexer.exchange.client import WallexClient
 from wallexer.exchange.errors import ApiError, TransportError
@@ -49,7 +50,7 @@ from wallexer.exchange.rules import (
 from wallexer.exchange.universe import Universe, build_universe, load_not_allowed
 from wallexer.execution.base import AccountSnapshot
 from wallexer.execution.live import LiveExecutor
-from wallexer.execution.paper import FillModel, PaperBook, PaperTrade
+from wallexer.execution.paper import FillModel, PaperBook
 from wallexer.execution.shadow import ShadowExecutor
 from wallexer.risk import gate
 from wallexer.risk.flatten import plan_flatten
@@ -104,7 +105,7 @@ class Engine:
         self.usdt_last_conversion: float | None = None
         self.usdt_cost_tmn = ZERO  # account USDT cost basis (usdt_inventory scoreboard line)
         self.dust: list[dict[str, str]] = []
-        self.replay_info: dict[str, Any] = {}
+        self._age_events: set[str] = set()
         self.credit: CreditCheck | None = None
 
     # ================================================================== startup
@@ -174,46 +175,42 @@ class Engine:
             limit_only=self.universe.limit_only,
         )
         self.fill = FillModel(cfg.paper.slippage_bps)
+        # candle history (incremental) -> live bars + regime reference
+        await sync_history(self.client, self.conn, symbols, cfg.backtest.history_days)
         self.feed = MarketFeed(self.client, self.conn, s, symbols)
         log_event(self.conn, "engine.feed_plan", self.feed.plan_intervals())
+        self.feed.load_from_store()
         await self.feed.poll_depth()
-        await self.feed.load_history(cfg.engine.replay_days)
-        # strategies
+        since = int(time.time()) - cfg.backtest.history_days * 86400
+        self.regime_ref = build_reference(
+            {sym: load_bars(self.conn, sym, "15", since) for sym in symbols}
+        )
+        # strategies, with the walk-forward selection (IS-chosen timeframe + params)
+        self.wf = self._load_walk_forward()
         sc, g = cfg.strategies, cfg.guardrails
+        mr_cfg = sc.mean_reversion.model_copy(
+            update=self.wf["strategies"].get("mean_reversion", {}).get("update", {})
+        )
+        mo_cfg = sc.momentum.model_copy(
+            update=self.wf["strategies"].get("momentum", {}).get("update", {})
+        )
         all_strats: list[Strategy] = [
             BasisTmnUsdt(sc.basis_tmn_usdt),
-            MeanReversion(sc.mean_reversion, g),
-            Momentum(sc.momentum, g),
+            MeanReversion(mr_cfg, g),
+            Momentum(mo_cfg, g),
         ]
-        self.strategies = [x for x in all_strats if getattr(sc, x.name).enabled]
-        # backtest replay -> seed promotion stats
-        t0 = time.time()
-        bt_books = {x.name: self._new_book(x.name, "backtest") for x in self.strategies}
-        spreads = {sym: self.feed.spread_bps(sym) or Decimal(0) for sym in symbols}
-        steps = replay(
-            self.strategies,
-            bt_books,
-            self.feed.bars,
-            spreads,
-            self.quotes,
-            self.fees,
-            vwap_bars=sc.mean_reversion.vwap_bars,
-            breakout_bars=sc.momentum.breakout_bars,
-            atr_bars=sc.momentum.atr_bars,
-            bases=BasisTmnUsdt.bases,
-        )
-        self.bt_trades: dict[str, list[PaperTrade]] = {n: b.closed for n, b in bt_books.items()}
-        for trades in self.bt_trades.values():
-            for t in trades:
-                repo.insert_paper_trade(self.conn, t, self.run_id)
-        self.replay_info = {
-            "days": cfg.engine.replay_days,
-            "steps": steps,
-            "seconds": round(time.time() - t0, 1),
-            "bars": {sym: len(b) for sym, b in self.feed.bars.items()},
-            "skipped": {n: b.skipped for n, b in bt_books.items()},
+        self.strategy_cfg = {
+            "basis_tmn_usdt": sc.basis_tmn_usdt,
+            "mean_reversion": mr_cfg,
+            "momentum": mo_cfg,
         }
-        log_event(self.conn, "engine.replay", self.replay_info)
+        self.strategies = [x for x in all_strats if self.strategy_cfg[x.name].enabled]
+        log_event(
+            self.conn,
+            "engine.walk_forward",
+            {k: v for k, v in self.wf.items() if k != "strategies"}
+            | {"selected": {n: v.get("update") for n, v in self.wf["strategies"].items()}},
+        )
         self.books = {x.name: self._new_book(x.name, "shadow") for x in self.strategies}
         # account / executor from exchange truth
         bals = await self.client.balances()
@@ -253,8 +250,9 @@ class Engine:
         b = self.feed.books.get("USDTTMN")
         return b.best_bid if b else None
 
-    def features(self, now: float) -> Features:
-        sc = self.settings.cfg.strategies
+    def features(self, now: float, timeframe: int = 1, cfg: Any = None) -> Features:
+        """Features on `timeframe` bars (1/5/15 resampled live, 60 native) + live top of book."""
+        cfg = cfg or self.strategy_cfg["momentum"]
         markets = {}
         for sym in self.symbols:
             book = self.feed.books.get(sym)
@@ -265,7 +263,7 @@ class Engine:
             markets[sym] = market_features(
                 sym,
                 self.quotes[sym],
-                self.feed.bars.get(sym, [])[-130:],
+                self.feed.bars_tf(sym, timeframe),
                 ts=now,
                 bid=book.best_bid,
                 ask=book.best_ask,
@@ -273,9 +271,10 @@ class Engine:
                 taker_fee=fee.taker,
                 book_issue=issue,
                 book_imbalance=imbalance(book),
-                vwap_bars=sc.mean_reversion.vwap_bars,
-                breakout_bars=sc.momentum.breakout_bars,
-                atr_bars=sc.momentum.atr_bars,
+                vwap_bars=cfg.vwap_bars,
+                breakout_bars=cfg.breakout_bars,
+                atr_bars=cfg.atr_bars,
+                timeframe=timeframe,
             )
         return Features(now, markets, basis_features(markets, BasisTmnUsdt.bases), self._usdt_bid())
 
@@ -340,18 +339,23 @@ class Engine:
 
     async def tick(self) -> None:
         now = time.time()
-        f = self.features(now)
+        f = self.features(now)  # 1-min features: account valuation, basis, rebalancing
         self.last_features = f
+        per_strategy = {
+            n: f if c.timeframe == 1 else self.features(now, c.timeframe, c)
+            for n, c in self.strategy_cfg.items()
+        }
         trades = self.feed.consume_trades()
         for strat in self.strategies:
             book = self.books[strat.name]
+            sf = per_strategy[strat.name]
             try:
-                sigs = strat.on_tick(f, book.view(), now)
+                sigs = strat.on_tick(sf, book.view(), now)
             except Exception as e:  # one strategy bug must not stop the engine
                 self.errors += 1
                 log.exception("strategy.error", strategy=strat.name, error=str(e))
                 continue
-            for t in book.step(sigs, f, now, trades=trades):
+            for t in book.step(sigs, sf, now, trades=trades):
                 repo.insert_paper_trade(self.conn, t, self.run_id)
         await self.executor.on_market(self.feed.books, trades, now)
         if isinstance(self.executor, ShadowExecutor):
@@ -621,16 +625,79 @@ class Engine:
 
     # ================================================================== allocation
 
+    def _load_walk_forward(self) -> dict[str, Any]:
+        """Latest walk-forward run: per strategy the IS-selected timeframe/params + OOS stats."""
+        row = latest_run(self.conn)
+        if row is None:
+            return {"run_id": None, "age_h": None, "strategies": {}}
+        ts = datetime.fromisoformat(row["ts"]).timestamp()
+        sel = json.loads(row["selected"])
+        out: dict[str, Any] = {}
+        for name, v in sel.items():
+            chosen = v.get("selected")
+            update: dict[str, Any] = {}
+            if chosen:
+                update = {"timeframe": int(chosen["timeframe"]), **chosen["params"]}
+                if "breakout_bars" in update:
+                    update["breakout_bars"] = int(update["breakout_bars"])
+            out[name] = {
+                "update": update,
+                "oos": stats_from_json(v["oos"]) if v.get("oos") else None,
+                "reason": v.get("reason", ""),
+            }
+        return {
+            "run_id": row["id"],
+            "ts": ts,
+            "split_ts": row["split_ts"],
+            "grid_size": row["grid_size"],
+            "report": row["report_path"],
+            "strategies": out,
+        }
+
+    def _run_age_h(self) -> float | None:
+        ts = self.wf.get("ts")
+        return None if ts is None else (time.time() - ts) / 3600
+
+    def _check_run_age(self) -> None:
+        """Warn early (warn_run_age_h) so the walk-forward is rerun before it expires."""
+        b = self.settings.cfg.backtest
+        age = self._run_age_h()
+        if age is None:
+            return
+        for kind, limit in (
+            ("backtest.run_aging", b.warn_run_age_h),
+            ("backtest.run_expired", b.max_run_age_h),
+        ):
+            key = f"{kind}:{self.wf['run_id']}"
+            if age >= limit and key not in self._age_events:
+                self._age_events.add(key)
+                log_event(
+                    self.conn,
+                    kind,
+                    {"run_id": self.wf["run_id"], "age_h": round(age, 1), "limit_h": limit},
+                )
+                log.warning(
+                    kind,
+                    run_id=self.wf["run_id"],
+                    age_h=round(age, 1),
+                    hint="wallexer backtest --walk-forward",
+                )
+
     def _evaluate_promotions(self) -> None:
         pc = self.settings.cfg.promotion
+        age = self._run_age_h()
         for strat in self.strategies:
             prev = self.statuses.get(strat.name)
+            wf = self.wf["strategies"].get(strat.name, {})
             st = promotion.evaluate(
                 strat.name,
-                self.bt_trades.get(strat.name, []),
+                wf.get("oos"),
+                wf.get("reason", "no walk-forward selection"),
                 self.books[strat.name].closed,
                 pc,
                 currently_promoted=bool(prev and prev.promoted),
+                run_age_h=age,
+                max_run_age_h=self.settings.cfg.backtest.max_run_age_h,
             )
             if prev is not None and prev.promoted != st.promoted:
                 repo.record_decision(
@@ -639,7 +706,11 @@ class Engine:
                     run_id=self.run_id,
                     strategy=strat.name,
                     action="promote" if st.promoted else "demote",
-                    signal={"backtest": st.backtest.as_dict(), "shadow": st.shadow.as_dict()},
+                    signal={
+                        "oos": st.oos.as_dict() if st.oos else None,
+                        "shadow": st.shadow.as_dict(),
+                        "walk_forward_run": self.wf.get("run_id"),
+                    },
                     reason=st.reason,
                 )
             self.statuses[strat.name] = st
@@ -649,8 +720,11 @@ class Engine:
         if f is None:
             return
         self._evaluate_promotions()
-        self.regime = classify(f)
-        trades = {n: [*self.bt_trades.get(n, []), *self.books[n].closed] for n in self.books}
+        self._check_run_age()
+        self.regime = classify(
+            self.features(time.time(), REGIME_TF, self.strategy_cfg["momentum"]), self.regime_ref
+        )
+        trades = {n: list(self.books[n].closed) for n in self.books}
         dds = {n: b.drawdown_pct(f) for n, b in self.books.items()}
         snapshot = {
             "regime": self.regime,
@@ -715,7 +789,7 @@ class Engine:
                 ZERO,
             )
             exposure[n] = usdt_val / eq if eq > 0 else ZERO
-            all_t = [*self.bt_trades.get(n, []), *b.closed]
+            all_t = list(b.closed)
             usdt_trades = sum(1 for t in all_t if t.kind == "trade" and t.market.endswith("USDT"))
             cycles = sum(1 for t in all_t if t.kind == "conversion")
             per_cycle[n] = Decimal(usdt_trades) / Decimal(max(cycles, 1))
@@ -816,11 +890,12 @@ class Engine:
                     "name": n,
                     "promoted": bool(st and st.promoted),
                     "paper_only": bool(st and st.paper_only),
-                    "status": "paper-only: non-atomic legs"
+                    "status": "paper-only: non-atomic legs · shadow-evaluated"
                     if st and st.paper_only
                     else ("promoted" if st and st.promoted else "paper"),
                     "reason": st.reason if st else "",
-                    "backtest": st.backtest.as_dict() if st else {},
+                    "timeframe": self.strategy_cfg[n].timeframe,
+                    "oos": st.oos.as_dict() if st and st.oos else {},
                     "shadow": st.shadow.as_dict() if st else {},
                     "weight": str(self.allocation.final.get(n, ZERO)) if self.allocation else "0",
                     "paper_equity": f"{b.equity(f):.0f}" if f else "–",
@@ -887,7 +962,16 @@ class Engine:
             "ratelimit_remaining": ml.remaining,
             "errors": self.errors + self.feed.errors,
             "events": {r["kind"]: r["n"] for r in events},
-            "replay": self.replay_info,
+            "walk_forward": {
+                "run_id": self.wf.get("run_id"),
+                "age_h": None if self._run_age_h() is None else round(self._run_age_h(), 1),
+                "max_age_h": self.settings.cfg.backtest.max_run_age_h,
+                "grid_size": self.wf.get("grid_size"),
+                "split": datetime.fromtimestamp(self.wf["split_ts"], UTC).isoformat()
+                if self.wf.get("split_ts")
+                else None,
+                "report": self.wf.get("report"),
+            },
             "dust": self.dust,
             "open_orders": len(self.executor.open_orders),
             "preflight": self.credit.message if self.credit else None,

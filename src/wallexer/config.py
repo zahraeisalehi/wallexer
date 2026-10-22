@@ -128,7 +128,6 @@ class EngineCfg(BaseModel):
     socket_path: str = "data/engine.sock"
     health_port: int = 8000
     log_path: str = "data/logs/engine.log"
-    replay_days: int = 3
 
 
 class PaperCfg(BaseModel):
@@ -141,25 +140,54 @@ class PaperCfg(BaseModel):
 
 class StrategyCfg(BaseModel):
     enabled: bool = True
+    # Candle timeframe in minutes: 1, 5, 15 (resampled from 1-min) or 60 (native).
+    timeframe: int = 15
+    # Markets by quote asset; empty = all universe markets.
+    quotes: list[str] = []
     edge_margin_bps: Decimal = Decimal("10")
     # mean_reversion
     vwap_bars: int = 60
     z_entry: float = 2.0
-    time_stop_min: int = 120
+    # exit target = VWAP + exit_frac x (entry deviation below VWAP)
+    exit_frac: float = 0.25
+    # expected move must be >= min_reward_risk x stop distance
+    min_reward_risk: float = 1.5
     # momentum
     breakout_bars: int = 30
     vol_ratio_min: float = 1.5
     imbalance_min: float = 0.1
     atr_target_mult: float = 2.0
+    # expected move (atr_target_mult x ATR) must be >= cost_mult x round-trip cost
+    cost_mult: float = 2.0
     # all
     atr_bars: int = 14
+    time_stop_bars: int = 24
     cooldown_min: int = 15
 
 
 class StrategiesCfg(BaseModel):
-    basis_tmn_usdt: StrategyCfg = StrategyCfg(edge_margin_bps=Decimal("5"))
-    mean_reversion: StrategyCfg = StrategyCfg()
-    momentum: StrategyCfg = StrategyCfg(time_stop_min=240)
+    basis_tmn_usdt: StrategyCfg = StrategyCfg(edge_margin_bps=Decimal("5"), timeframe=1)
+    mean_reversion: StrategyCfg = StrategyCfg(quotes=["TMN"])
+    momentum: StrategyCfg = StrategyCfg(time_stop_bars=16)
+
+
+class BacktestCfg(BaseModel):
+    history_days: int = 30
+    split_frac: float = 2 / 3  # oldest part in-sample, newest out-of-sample
+    timeframes: list[int] = [1, 5, 15, 60]
+    min_is_trades: int = 10  # IS selection needs at least this many trades and PF > 1
+    # Engine: runs older than this cannot promote a strategy; warn earlier so it is rerun.
+    max_run_age_h: float = 36
+    warn_run_age_h: float = 20
+    grid_mean_reversion: dict[str, list[float]] = {
+        "z_entry": [1.5, 2.0, 2.5],
+        "exit_frac": [0.0, 0.25, 0.5],
+    }
+    grid_momentum: dict[str, list[float]] = {
+        "breakout_bars": [20, 40],
+        "atr_target_mult": [2.0, 3.0],
+        "vol_ratio_min": [1.5, 2.0],
+    }
 
 
 class PromotionCfg(BaseModel):
@@ -200,6 +228,7 @@ class AppConfig(BaseModel):
     strategies: StrategiesCfg = StrategiesCfg()
     promotion: PromotionCfg = PromotionCfg()
     alloc: AllocCfg = AllocCfg()
+    backtest: BacktestCfg = BacktestCfg()
 
     def path(self, rel: str) -> Path:
         """Resolve a config-relative path against the repo root."""

@@ -1,8 +1,13 @@
-"""Mean reversion: fade a stretched move below the rolling VWAP.
+"""Mean reversion: fade a stretched move below the rolling VWAP (TMN markets only for now).
 
-Entry (maker, not urgent): VWAP z-score <= -z_entry AND the expected reversion to VWAP, in bps
-from the ask, exceeds the market's real round trip (maker entry + taker exit + spread) + margin.
-Exit (taker): price back at VWAP (z >= 0), stop hit, or time stop.
+Entry (maker, not urgent), all of:
+- VWAP z-score <= -z_entry;
+- expected move >= min_reward_risk x stop distance (1.5 by default);
+- expected move > the market's real round trip (maker entry + taker exit + spread) + margin.
+Expected move = target - ask, where target = VWAP + exit_frac x entry deviation and
+entry deviation = VWAP - ask at entry (so the exit is past VWAP, not exactly at it).
+Exit (taker): bid reaches the target (deviation fixed at entry, VWAP live), the stop, or the
+time stop (time_stop_bars x timeframe).
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from decimal import Decimal
 from wallexer.config import GuardrailsCfg, StrategyCfg
 from wallexer.data.features import Features
 from wallexer.exchange.models import Side
-from wallexer.strategies.base import BookView, Signal, cooled_down, costs, stop_price
+from wallexer.strategies.base import BookView, Signal, cooled_down, costs, in_scope, stop_price
 
 
 class MeanReversion:
@@ -23,16 +28,18 @@ class MeanReversion:
         self.guard = guard
 
     def on_tick(self, f: Features, book: BookView, now: float) -> list[Signal]:
+        cfg = self.cfg
         out: list[Signal] = []
         for sym, m in f.markets.items():
             pos = book.positions.get(sym)
             if pos is not None:
                 why = None
+                target = (m.vwap + cfg.exit_frac * pos.entry_dev) if m.vwap is not None else None
                 if m.bid <= pos.stop:
                     why = "stop"
-                elif m.vwap_z is not None and m.vwap_z >= 0:
-                    why = "reverted_to_vwap"
-                elif now - pos.entry_ts >= self.cfg.time_stop_min * 60:
+                elif target is not None and float(m.bid) >= target:
+                    why = "target"
+                elif now - pos.entry_ts >= cfg.time_stop_bars * m.timeframe * 60:
                     why = "time_stop"
                 if why:
                     out.append(
@@ -47,29 +54,38 @@ class MeanReversion:
                                 "exit": why,
                                 "bid": str(m.bid),
                                 "stop": str(pos.stop),
+                                "target": target,
                                 "vwap_z": m.vwap_z,
                             },
                         )
                     )
                 continue
             if (
-                not m.book_ok
+                not in_scope(m.quote, cfg.quotes)
+                or not m.book_ok
                 or sym in book.pending
                 or m.vwap_z is None
                 or m.vwap is None
-                or m.vwap_z > -self.cfg.z_entry
-                or not cooled_down(book, sym, now, self.cfg.cooldown_min)
+                or m.vwap_z > -cfg.z_entry
+                or not cooled_down(book, sym, now, cfg.cooldown_min)
             ):
                 continue
             ask = float(m.ask)
-            edge_bps = Decimal(str(round((m.vwap - ask) / ask * 1e4, 4)))
-            threshold = m.round_trip_bps(maker_entry=True) + self.cfg.edge_margin_bps
-            if edge_bps <= threshold:
+            dev = m.vwap - ask
+            if dev <= 0:
                 continue
-            entry_px = m.bid  # maker: rest at best bid
+            target = m.vwap + cfg.exit_frac * dev
+            move_bps = (target - ask) / ask * 1e4
             stop = stop_price(
-                m, entry_px, float(self.guard.stop_loss_atr_mult), self.guard.stop_loss_max_pct
+                m, m.ask, float(self.guard.stop_loss_atr_mult), self.guard.stop_loss_max_pct
             )
+            stop_bps = float((m.ask - stop) / m.ask) * 1e4
+            threshold = m.round_trip_bps(maker_entry=True) + cfg.edge_margin_bps
+            if (
+                move_bps < cfg.min_reward_risk * stop_bps
+                or Decimal(str(round(move_bps, 4))) <= threshold
+            ):
+                continue
             out.append(
                 Signal(
                     self.name,
@@ -77,18 +93,23 @@ class MeanReversion:
                     Side.BUY,
                     "entry",
                     "maker",
-                    min(1.0, -m.vwap_z / (2 * self.cfg.z_entry)),
+                    min(1.0, -m.vwap_z / (2 * cfg.z_entry)),
                     {
-                        "rule": "vwap_z <= -z_entry and reversion edge > round trip + margin",
+                        "rule": "z <= -z_entry; move >= 1.5 x stop; move > round trip + margin",
+                        "timeframe": m.timeframe,
                         "vwap_z": round(m.vwap_z, 3),
-                        "z_entry": self.cfg.z_entry,
+                        "z_entry": cfg.z_entry,
                         "vwap": round(m.vwap, 8),
                         "ask": str(m.ask),
-                        "expected_edge_bps": f"{edge_bps:.2f}",
-                        **costs(m, True, self.cfg.edge_margin_bps),
-                        "atr_bps": m.atr_bps,
+                        "target": round(target, 8),
+                        "exit_frac": cfg.exit_frac,
+                        "expected_move_bps": round(move_bps, 2),
+                        "stop_bps": round(stop_bps, 2),
+                        "reward_risk": round(move_bps / stop_bps, 2) if stop_bps else None,
+                        **costs(m, True, cfg.edge_margin_bps),
                     },
                     stop=stop,
+                    entry_dev=dev,
                 )
             )
         return out

@@ -152,6 +152,47 @@ CREATE TABLE IF NOT EXISTS equity_curve (
 );
 CREATE INDEX IF NOT EXISTS ix_equity_ts ON equity_curve(ts);
 
+-- Incremental history ledger: a complete past chunk is never fetched again.
+CREATE TABLE IF NOT EXISTS history_chunks (
+    symbol      TEXT NOT NULL,
+    resolution  TEXT NOT NULL,             -- native: 1 | 60
+    chunk_start INTEGER NOT NULL,          -- unix seconds
+    chunk_end   INTEGER NOT NULL,
+    bars        INTEGER NOT NULL,
+    complete    INTEGER NOT NULL,          -- 0 for the chunk that includes "now"
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (symbol, resolution, chunk_start)
+);
+
+-- Walk-forward runs (tune in-sample, judge out-of-sample) and their per-row results.
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id          INTEGER PRIMARY KEY,
+    ts          TEXT NOT NULL,
+    kind        TEXT NOT NULL,             -- walk_forward
+    split_ts    INTEGER NOT NULL,
+    history_from INTEGER NOT NULL,
+    history_to  INTEGER NOT NULL,
+    grid_size   INTEGER NOT NULL,
+    grids       TEXT NOT NULL,             -- JSON: the parameter grids evaluated
+    spreads     TEXT NOT NULL,             -- JSON: spread bps per market + source
+    selected    TEXT NOT NULL,             -- JSON: per strategy, chosen timeframe/params + OOS stats
+    report_path TEXT
+);
+CREATE TABLE IF NOT EXISTS backtest_results (
+    run_id      INTEGER NOT NULL REFERENCES backtest_runs(id),
+    strategy    TEXT NOT NULL,
+    timeframe   INTEGER NOT NULL,
+    market      TEXT NOT NULL,             -- symbol, or '*' for the pooled book
+    params      TEXT NOT NULL,
+    segment     TEXT NOT NULL,             -- IS | OOS
+    trades      INTEGER NOT NULL,
+    net_tmn     TEXT NOT NULL,
+    pf          TEXT,
+    max_dd_pct  TEXT NOT NULL,
+    selected    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_bt_results_run ON backtest_results(run_id, strategy);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,

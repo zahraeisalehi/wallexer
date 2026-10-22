@@ -5,8 +5,11 @@
 - Rate budget: the market-data limit is 600 requests per 39 s window (user-confirmed). Intervals
   are stretched at startup so planned calls stay under `feed_budget_frac` of it.
 - Book health: crossed/locked (bid >= ask), stale (no fresh fetch for 3 intervals, or the book
-  unchanged for frozen_book_s while trades printed). Unhealthy books -> no signals + an event
-  (rate-limited per market and issue).
+  unchanged for frozen_book_s AND >= FROZEN_MIN_TRADES trades printed in that window; one or two
+  prints at the touch can legitimately leave the top unchanged). Unhealthy books -> no signals +
+  an event (rate-limited per market and issue).
+- Candles: 1-min bars live (seeded from the stored history), resampled to 5/15-min on change;
+  60-min bars are native and polled every 5 minutes.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from decimal import Decimal
 import structlog
 
 from wallexer.config import Settings
-from wallexer.data.candles import Bar, completed, fetch_bars
+from wallexer.data.candles import Bar, completed, fetch_bars, resample
 from wallexer.data.features import book_health
 from wallexer.exchange.client import WallexClient
 from wallexer.exchange.errors import ApiError, TransportError
@@ -28,7 +31,10 @@ from wallexer.store import repo
 from wallexer.store.db import log_event
 
 log = structlog.get_logger(__name__)
-MAX_BARS = 600
+WINDOW_BARS = 130  # features look back this many bars on any timeframe
+MAX_BARS = WINDOW_BARS * 15 + 60  # enough 1-min bars to resample 130 15-min bars
+FROZEN_MIN_TRADES = 3
+H60_POLL_S = 300
 EVENT_EVERY_S = 60.0
 
 
@@ -47,8 +53,11 @@ class MarketFeed:
         self.books: dict[str, Book] = {}
         self.book_ts: dict[str, float] = {}
         self._book_sig: dict[str, tuple[str, float]] = {}  # signature, last change ts
-        self._last_trade_ts: dict[str, float] = {}
-        self.bars: dict[str, list[Bar]] = {s: [] for s in symbols}
+        self._trades_since_change: dict[str, int] = {}
+        self.bars: dict[str, list[Bar]] = {s: [] for s in symbols}  # 1-min
+        self.bars60: dict[str, list[Bar]] = {s: [] for s in symbols}
+        self._tf_cache: dict[tuple[str, int], tuple[int, list[Bar]]] = {}
+        self._h60_next = 0.0
         self._seen: dict[str, set[tuple]] = {s: set() for s in symbols}
         self._new_trades: dict[str, list[Trade]] = {s: [] for s in symbols}
         self._events_at: dict[tuple[str, str], float] = {}
@@ -108,6 +117,7 @@ class MarketFeed:
             prev = self._book_sig.get(sym)
             if prev is None or prev[0] != sig:
                 self._book_sig[sym] = (sig, ts)
+                self._trades_since_change[sym] = 0
             bids = sorted(book.bid, key=lambda lv: lv.price, reverse=True)[:10]
             asks = sorted(book.ask, key=lambda lv: lv.price)[:10]
             repo.insert_depth_snapshot(
@@ -139,17 +149,45 @@ class MarketFeed:
                 }
             if fresh:
                 self._new_trades[sym].extend(fresh)
-                self._last_trade_ts[sym] = time.time()
+                self._trades_since_change[sym] = self._trades_since_change.get(sym, 0) + len(fresh)
 
-    async def load_history(self, days: int) -> None:
+    def load_from_store(self) -> None:
+        """Seed live bars from the stored history (run history sync first)."""
+        from wallexer.data.history import load_bars
+
         now = int(time.time())
         for sym in self.symbols:
-            bars = await fetch_bars(self.client, sym, now - days * 86400, now)
-            self.bars[sym] = completed(bars)
-            repo.upsert_candles(self.conn, sym, "1", self.bars[sym])
+            self.bars[sym] = load_bars(self.conn, sym, "1", now - MAX_BARS * 60)
+            self.bars60[sym] = load_bars(self.conn, sym, "60", now - WINDOW_BARS * 3600 - 3600)
+
+    def bars_tf(self, sym: str, tf: int) -> list[Bar]:
+        """Completed bars of timeframe `tf` (1/5/15 resampled from 1-min; 60 native)."""
+        if tf == 60:
+            return self.bars60.get(sym, [])
+        ones = self.bars.get(sym, [])
+        if tf == 1:
+            return ones
+        key = (sym, tf)
+        last = ones[-1].t if ones else 0
+        cached = self._tf_cache.get(key)
+        if cached is None or cached[0] != last:
+            cached = (last, completed(resample(ones, tf), tf))
+            self._tf_cache[key] = cached
+        return cached[1]
 
     async def poll_candles(self) -> None:
         now = int(time.time())
+        if now >= self._h60_next:
+            self._h60_next = now + H60_POLL_S
+            for sym in self.symbols:
+                fresh60 = completed(
+                    await fetch_bars(self.client, sym, now - 2 * 86400, now, "60"), 60
+                )
+                if fresh60:
+                    have = {b.t: b for b in self.bars60[sym]}
+                    have.update({b.t: b for b in fresh60})
+                    self.bars60[sym] = [have[t] for t in sorted(have)][-(WINDOW_BARS + 10) :]
+                    repo.upsert_candles(self.conn, sym, "60", fresh60)
         for sym in self.symbols:
             fresh = completed(await fetch_bars(self.client, sym, now - 15 * 60, now))
             if not fresh:
@@ -178,9 +216,9 @@ class MarketFeed:
         )
         if problem is None:
             sig = self._book_sig.get(sym)
-            traded = self._last_trade_ts.get(sym, 0.0)
-            if sig and now - sig[1] > ecfg.frozen_book_s and traded > sig[1]:
-                problem = "stale"  # book frozen while the market traded
+            prints = self._trades_since_change.get(sym, 0)
+            if sig and now - sig[1] > ecfg.frozen_book_s and prints >= FROZEN_MIN_TRADES:
+                problem = "stale"  # book frozen while the market kept trading
         if problem is not None:
             key = (sym, problem)
             if now - self._events_at.get(key, 0.0) >= EVENT_EVERY_S:

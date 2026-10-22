@@ -128,3 +128,40 @@ def test_below_entry_floor_is_skipped():
     b = book(frac="0.01")  # 50k < 200k floor
     b.step([entry("BTCTMN")], feats(mf("BTCTMN", "19990000000", "20000000000")), 1.0)
     assert not b.lots and b.skipped["below_entry_floor"] == 1
+
+
+def test_resample_1m_to_5m_ohlcv():
+    from wallexer.data.candles import Bar, resample
+
+    t0 = 1_800_000_000 - 1_800_000_000 % 300
+    ones = [Bar(t0 + i * 60, D(10 + i), D(20 + i), D(5 + i), D(11 + i), D(1)) for i in range(7)]
+    del ones[2]  # a gap inside the first bucket
+    five = resample(ones, 5)
+    assert [b.t for b in five] == [t0, t0 + 300]
+    b = five[0]  # minutes 0,1,3,4
+    assert (b.o, b.h, b.l, b.c, b.v) == (D(10), D(24), D(5), D(15), D(4))
+    assert (five[1].o, five[1].c, five[1].v) == (D(15), D(17), D(2))
+
+
+def test_mean_reversion_exits_at_vwap_plus_fraction_of_entry_deviation():
+    from dataclasses import replace
+
+    from wallexer.config import GuardrailsCfg, StrategyCfg
+    from wallexer.strategies.mean_reversion import MeanReversion
+
+    strat = MeanReversion(StrategyCfg(quotes=["TMN"], exit_frac=0.5, timeframe=15), GuardrailsCfg())
+    b = book()
+    base = mf("BTCTMN", "19990000000", "20000000000")
+    # entry: VWAP 20.5e9, ask 20e9 → entry_dev 0.5e9 → target = VWAP + 0.25e9
+    sig = replace(entry("BTCTMN"), entry_dev=500_000_000.0, stop=D("19000000000"))
+    b.step([sig], feats(base), 0.0)
+    assert b.lots["BTCTMN"].pos.entry_dev == 500_000_000.0
+    view = b.view()
+    below = replace(mf("BTCTMN", "20700000000", "20710000000"), vwap=20_500_000_000.0, vwap_z=0.5)
+    assert strat.on_tick(feats(below), view, 60.0) == []  # 20.70e9 < target 20.75e9
+    at = replace(mf("BTCTMN", "20750000000", "20760000000"), vwap=20_500_000_000.0, vwap_z=0.6)
+    [ex] = strat.on_tick(feats(at), view, 60.0)
+    assert ex.kind == "exit" and ex.reason["exit"] == "target"
+    # peak updates must not drop entry_dev
+    b.step([], feats(at), 61.0)
+    assert b.lots["BTCTMN"].pos.entry_dev == 500_000_000.0
