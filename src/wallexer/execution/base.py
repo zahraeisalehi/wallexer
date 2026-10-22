@@ -35,6 +35,8 @@ class AccountSnapshot:
     free: dict[str, Decimal] = field(default_factory=dict)
     locked: dict[str, Decimal] = field(default_factory=dict)
 
+    # free = available to sell/spend; locked = reserved by open orders; total = free + locked
+    # (= the exchange's balance `value`, which already includes locked funds).
     def total(self, asset: str) -> Decimal:
         return self.free.get(asset, Decimal(0)) + self.locked.get(asset, Decimal(0))
 

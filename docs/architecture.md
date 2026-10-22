@@ -118,6 +118,7 @@ The risk gate can only reduce or reject orders, never enlarge them. It runs afte
 
 ## 4. Orders and state
 - All money math uses `Decimal`. Prices and amounts are rounded to each market's `price_precision` / `amount_precision`.
+- Exit LIMITs never go further than 4% (or the market's tighter threshold) from the exchange fair price.
 - Prefer limit orders at/inside the spread; convert to aggressive only for stops and the final flatten: MARKET where the market allows it, otherwise an aggressive LIMIT 0.5% past the best opposite price, re-priced while unfilled (see wallex-api.md).
 - The exchange is the source of truth: reconcile open orders and balances every cycle; never trust local state after a timeout.
 - Every order row carries `decision_id`; every decision row stores features, signal, weights, risk checks, and final action.

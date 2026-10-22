@@ -6,8 +6,9 @@ We trade only with the trading-credit (sub) account, which starts with ~5,000,00
   otherwise shadow/trade refuse to start.
 - Later starts: equity and drawdown vs 5M are reported (warning only), so a restart while holding
   positions can always start and trade back to TMN.
-Equity counts value + locked (assumption: `value` excludes funds locked in open orders; verify
-on the first live open order, double counting would hide drawdown).
+Balance `value` is the TOTAL including funds locked in open orders (verified by the live smoke
+test 2026-10-22: with a 100,039 TMN order open, value stayed 5,000,000 while locked rose to
+100,039). So equity = value (coins marked at best bid); free = value - locked.
 """
 
 from __future__ import annotations
@@ -70,14 +71,14 @@ def value_balances(
 ) -> tuple[Decimal, dict[str, Decimal], list[str]]:
     """Return (TMN total, {asset: value in TMN}, unpriced assets).
 
-    Totals are value + locked; coins are marked at best bid (liquidation value).
+    `value` already includes locked funds; coins are marked at best bid (liquidation value).
     """
-    tmn = (balances[TMN].value + balances[TMN].locked) if TMN in balances else Decimal(0)
+    tmn = balances[TMN].value if TMN in balances else Decimal(0)
     usdt_bid = _bid(books, "USDTTMN")
     valued: dict[str, Decimal] = {}
     unpriced: list[str] = []
     for asset, bal in balances.items():
-        total = bal.value + bal.locked
+        total = bal.value
         if asset == TMN or total <= 0:
             continue
         bid = _bid(books, f"{asset}TMN")
@@ -98,7 +99,7 @@ async def check_trading_credit(
 ) -> CreditCheck:
     acfg = settings.cfg.account
     balances = await client.balances()  # always sent with the sub-account header
-    held = [a for a, b in balances.items() if a != TMN and (b.value + b.locked) > 0]
+    held = [a for a, b in balances.items() if a != TMN and b.value > 0]
     books = await _books_for(client, held) if held else {}
     tmn, valued, unpriced = value_balances(balances, books)
     equity = tmn + sum(valued.values(), Decimal(0))

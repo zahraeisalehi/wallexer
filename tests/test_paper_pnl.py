@@ -165,3 +165,44 @@ def test_mean_reversion_exits_at_vwap_plus_fraction_of_entry_deviation():
     # peak updates must not drop entry_dev
     b.step([], feats(at), 61.0)
     assert b.lots["BTCTMN"].pos.entry_dev == 500_000_000.0
+
+
+def test_account_equity_uses_value_only_value_includes_locked():
+    """Live smoke test 2026-10-22: with an order open, value stayed 5,000,000 and locked rose to
+    100,039, i.e. `value` is the TOTAL. Equity must not add `locked` again."""
+    from wallexer.exchange.account import value_balances
+    from wallexer.exchange.models import Balance, Book, DepthLevel
+
+    bals = {
+        "TMN": Balance(asset="TMN", value=D(5_000_000), locked=D(100_039)),
+        "BTC": Balance(asset="BTC", value=D("0.001"), locked=D("0.0005")),
+    }
+    books = {
+        "BTCTMN": Book(
+            bid=[DepthLevel(price=D("20000000000"), quantity=D(1))],
+            ask=[DepthLevel(price=D("20010000000"), quantity=D(1))],
+        ),
+        "USDTTMN": Book(
+            bid=[DepthLevel(price=D(270000), quantity=D(1))],
+            ask=[DepthLevel(price=D(270100), quantity=D(1))],
+        ),
+    }
+    tmn, valued, unpriced = value_balances(bals, books)
+    assert tmn == D(5_000_000)  # not 5,100,039
+    assert valued == {"BTC": D("0.001") * D("20000000000")}  # value only, marked at best bid
+    assert unpriced == []
+
+
+async def test_live_snapshot_free_is_value_minus_locked():
+    from wallexer.exchange.models import Balance
+    from wallexer.execution.live import LiveExecutor
+
+    class FakeClient:
+        async def balances(self):
+            return {"TMN": Balance(asset="TMN", value=D(5_000_000), locked=D(100_039))}
+
+    ex = object.__new__(LiveExecutor)  # snapshot only needs the client
+    ex.client = FakeClient()
+    snap = await ex.snapshot()
+    assert snap.free["TMN"] == D(5_000_000) - D(100_039)
+    assert snap.total("TMN") == D(5_000_000)

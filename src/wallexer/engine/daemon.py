@@ -43,6 +43,7 @@ from wallexer.exchange.errors import ApiError, TransportError
 from wallexer.exchange.models import Side
 from wallexer.exchange.prop import fetch_package, load_unavailable, save_unavailable
 from wallexer.exchange.rules import (
+    FairBand,
     MarketRules,
     OrderRuleError,
     OrderSpec,
@@ -59,6 +60,7 @@ from wallexer.risk import gate
 from wallexer.risk.flatten import plan_flatten
 from wallexer.risk.guardrails import Limits
 from wallexer.risk.schedule import Phase, phase
+from wallexer.risk.schedule import times as schedule_times
 from wallexer.store import repo
 from wallexer.store.db import dumps, event_sink, init_db, log_event, now_iso
 from wallexer.strategies.base import Strategy
@@ -242,7 +244,13 @@ class Engine:
         base_of = {sym: r.base_asset for sym, r in self.all_rules.items()}
         if self.mode is Mode.trade:
             self.executor = LiveExecutor(
-                s, self.client, self.conn, self.all_rules, lambda: self._usdt_bid(), self.mode
+                s,
+                self.client,
+                self.conn,
+                self.all_rules,
+                lambda: self._usdt_bid(),
+                self.mode,
+                band=self.band,
             )
             await self.executor.reconcile_open_orders()
         else:
@@ -269,6 +277,19 @@ class Engine:
         )
 
     # ================================================================== features
+
+    def band(self, symbol: str) -> FairBand | None:
+        """Exchange fair price + allowed exit distance for `symbol` (refreshed every minute)."""
+        m = self.markets_by_symbol.get(symbol)
+        if m is None:
+            return None
+        fb = m.fair_band(self.settings.cfg.orders.exit_max_fair_deviation_pct)
+        return FairBand(*fb) if fb else None
+
+    async def _refresh_markets(self) -> None:
+        """Fair prices move: re-read /markets (one cached call) for the exit price band."""
+        fresh = await self.client.markets()
+        self.markets_by_symbol = {m.symbol: m for m in fresh if m.is_spot}
 
     def _usdt_bid(self) -> Decimal | None:
         b = self.feed.books.get("USDTTMN")
@@ -606,6 +627,7 @@ class Engine:
                         decision_id=did,
                         n=1,
                         slippage_pct=o.exit_limit_slippage_pct,
+                        band=self.band(sym),
                     )
                 except OrderRuleError as e:
                     log_event(
@@ -655,6 +677,7 @@ class Engine:
             slippage_pct=o.exit_limit_slippage_pct,
             blocked=blocked,
             only_assets=only,
+            bands={sym: b for sym in self.all_rules if (b := self.band(sym)) is not None},
         )
         for d in plan.dust:
             if d.asset not in {x["asset"] for x in self.dust}:
@@ -1141,6 +1164,7 @@ class Engine:
                     decision_id=did,
                     n=1,
                     slippage_pct=o.exit_limit_slippage_pct,
+                    band=self.band("USDTTMN"),
                 )
         except OrderRuleError as e:
             log_event(self.conn, "order.build_failed", {"decision_id": did, "error": str(e)})
@@ -1252,6 +1276,9 @@ class Engine:
             "phase": phase(
                 time.time(), self.event_end, g.flatten_no_entry_min * 60, g.flatten_force_min * 60
             ).value,
+            "schedule": schedule_times(
+                self.event_end, g.flatten_no_entry_min * 60, g.flatten_force_min * 60
+            ),
             "event_end_utc": self.settings.secrets.event_end_utc.isoformat()
             if self.settings.secrets.event_end_utc
             else None,
@@ -1477,6 +1504,7 @@ class Engine:
                 asyncio.create_task(
                     self._every(ecfg.reconcile_interval_s, self._reconcile, "reconcile")
                 ),
+                asyncio.create_task(self._every(60.0, self._refresh_markets, "markets")),
             ]
             if self.settings.cfg.backtest.rerun_every_h > 0:
                 tasks.append(asyncio.create_task(self._rerun_loop()))

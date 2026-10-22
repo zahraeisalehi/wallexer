@@ -233,3 +233,31 @@ def test_agent_schema_rejects_out_of_range():
                 }
             ]
         )
+
+
+def test_event_schedule_boundaries_with_config_defaults():
+    """Real end 2026-10-23 20:20 UTC: entries stop 18:50 (T-90), flatten 19:45 (T-35)."""
+    from datetime import UTC, datetime
+
+    from wallexer.config import GuardrailsCfg
+    from wallexer.risk.schedule import Phase, phase, times
+
+    g = GuardrailsCfg()
+    assert (g.flatten_no_entry_min, g.flatten_force_min) == (90, 35)
+    end = datetime(2026, 10, 23, 20, 20, tzinfo=UTC).timestamp()
+    ne, fl = g.flatten_no_entry_min * 60, g.flatten_force_min * 60
+
+    def at(h: int, m: int) -> Phase:
+        return phase(datetime(2026, 10, 23, h, m, tzinfo=UTC).timestamp(), end, ne, fl)
+
+    assert at(18, 49) is Phase.normal
+    assert at(18, 50) is Phase.no_entries
+    assert at(19, 44) is Phase.no_entries
+    assert at(19, 45) is Phase.flatten
+    assert at(20, 19) is Phase.flatten
+    assert at(20, 20) is Phase.ended
+    assert times(end, ne, fl) == {
+        "entries_stop": "2026-10-23 18:50 UTC",
+        "flatten_from": "2026-10-23 19:45 UTC",
+        "end": "2026-10-23 20:20 UTC",
+    }

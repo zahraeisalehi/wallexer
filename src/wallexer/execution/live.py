@@ -26,7 +26,7 @@ from wallexer.exchange.errors import (
     TransportError,
 )
 from wallexer.exchange.models import Book, OrderType, Trade
-from wallexer.exchange.rules import MarketRules, OrderRuleError, OrderSpec, reprice_exit
+from wallexer.exchange.rules import FairBand, MarketRules, OrderRuleError, OrderSpec, reprice_exit
 from wallexer.execution.base import AccountSnapshot, ExecResult, OpenOrder
 from wallexer.store import repo
 from wallexer.store.db import log_event
@@ -46,6 +46,7 @@ class LiveExecutor:
         rules: dict[str, MarketRules],
         usdt_tmn: Callable[[], Decimal | None],
         mode: Mode,
+        band: Callable[[str], FairBand | None] | None = None,
     ) -> None:
         if mode is not Mode.trade:
             raise RuntimeError("LiveExecutor may only be created in trade mode")
@@ -54,6 +55,7 @@ class LiveExecutor:
         self.conn = conn
         self.rules = rules
         self.usdt_tmn = usdt_tmn
+        self.band = band or (lambda _s: None)
         self.open_orders: dict[str, OpenOrder] = {}
         client.enable_orders()  # the single call site of the order latch
         log.warning("live.orders_enabled")
@@ -174,6 +176,7 @@ class LiveExecutor:
                     attempt=o.reprices + 1,
                     slippage_pct=oc.exit_limit_slippage_pct,
                     max_reprices=oc.exit_max_reprices,
+                    band=self.band(o.spec.symbol),
                 )
             except OrderRuleError as e:
                 log_event(
@@ -205,9 +208,11 @@ class LiveExecutor:
         return out
 
     async def snapshot(self) -> AccountSnapshot:
+        """Exchange balances. `value` is the TOTAL (incl. locked), so free = value - locked and
+        AccountSnapshot.total(asset) == value (no double counting of locked funds)."""
         bals = await self.client.balances()
         return AccountSnapshot(
-            {a: b.value for a, b in bals.items()},
+            {a: b.value - b.locked for a, b in bals.items()},
             {a: b.locked for a, b in bals.items() if b.locked},
         )
 

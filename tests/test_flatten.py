@@ -109,7 +109,7 @@ async def test_end_of_event_flatten_schedule(tmp_path):
     from wallexer.risk import gate
     from wallexer.risk.guardrails import Limits
 
-    end = datetime(2026, 10, 23, 20, 0, tzinfo=UTC)
+    end = datetime(2026, 10, 23, 20, 20, tzinfo=UTC)  # real event end
     settings = Settings(
         cfg=AppConfig(
             store=StoreCfg(db_path=str(tmp_path / "t.db"), overrides_path=str(tmp_path / "o.toml"))
@@ -122,6 +122,7 @@ async def test_end_of_event_flatten_schedule(tmp_path):
     books = dict(BOOKS) | {"XAUTTMN": bk("400000000", "401000000")}
     eng.symbols = list(rules)
     eng.all_rules = rules
+    eng.markets_by_symbol = {}  # no fair-price data in this test → no band clamp
     eng.forbidden = eng.unavailable = frozenset()
     eng.fees = parse_fee_table({}, D("0.003"), D("0.003"))
     eng.limits = Limits.from_settings(settings, forbidden=frozenset(), unavailable=frozenset())
@@ -139,8 +140,8 @@ async def test_end_of_event_flatten_schedule(tmp_path):
     eng.equity = eng._account_equity()
     eng.peak_equity = eng.day_start_equity = eng.equity
 
-    t_minus_25 = end.timestamp() - 25 * 60
-    eng._risk_monitor(t_minus_25)
+    t_flatten = end.timestamp() - 34 * 60  # 19:46 UTC: inside the T-35 flatten window
+    eng._risk_monitor(t_flatten)
     assert eng.flatten_requested == set()
     assert (
         eng.conn.execute(
@@ -172,3 +173,56 @@ async def test_end_of_event_flatten_schedule(tmp_path):
     assert not r.approved and "end of event" in r.reason
     await eng.client.aclose()
     eng.conn.close()
+
+
+def test_exit_price_never_beyond_fair_band_even_in_a_crashing_book():
+    from wallexer.exchange.rules import FairBand, aggressive_price, choose_exit_order
+
+    sol = RULES["SOLTMN"]  # MARKET disabled → aggressive LIMIT
+    fair = FairBand(D(50_000_000), D(4))
+    crash = bk("40000000", "40100000")  # book 20% below fair
+    # unclamped: 40,000,000 x 0.995 = 39,800,000 (-20.4%); clamped: fair x 0.96 = 48,000,000
+    assert aggressive_price(sol, Side.SELL, crash, D("0.5")) == D("39800000")
+    assert aggressive_price(sol, Side.SELL, crash, D("0.5"), fair) == D("48000000")
+    # a normal book is untouched (49,750,000 is within 4% of fair)
+    assert aggressive_price(sol, Side.SELL, bk("50000000", "50100000"), D("0.5"), fair) == D(
+        "49750000"
+    )
+    # buys are capped above fair
+    spike = bk("59000000", "60000000")
+    assert aggressive_price(sol, Side.BUY, spike, D("0.5"), fair) == D("52000000")
+    spec = choose_exit_order(
+        sol, Side.SELL, D(3), crash, decision_id=1, n=1, slippage_pct=D("0.5"), band=fair
+    )
+    assert spec.price == D("48000000")
+    # flatten passes the per-market band through
+    p = plan_flatten(
+        {"SOL": D(3)},
+        {**BOOKS, "SOLTMN": crash},
+        RULES,
+        decision_id=7,
+        dust_cap_tmn=D(1000),
+        slippage_pct=D("0.5"),
+        bands={"SOLTMN": fair},
+    )
+    assert p.orders[0].price == D("48000000")
+
+
+def test_fair_band_uses_market_threshold_when_tighter():
+    from wallexer.exchange.models import Market
+
+    m = Market.model_validate(
+        {
+            "symbol": "USDTTMN",
+            "base_asset": "USDT",
+            "quote_asset": "TMN",
+            "amount_precision": 2,
+            "price_precision": 0,
+            "fair_price": {"bid": "272000", "ask": "272000", "spot": {"threshold": "3"}},
+        }
+    )
+    assert m.fair_band(D(4)) == (D(272000), D(3))
+    assert (
+        Market.model_validate({**m.model_dump(by_alias=True), "fair_price": None}).fair_band(D(4))
+        is None
+    )

@@ -1,7 +1,9 @@
 # wallexer runbook
 
-Event end: **2026-10-23 20:00 UTC** (`EVENT_END_UTC`). New entries stop at **18:30 UTC** (T-90 min);
-the engine force-flattens everything to TMN from **19:30 UTC** (T-30 min).
+Event end: **2026-10-23 20:20 UTC** (`EVENT_END_UTC=2026-10-23T20:20:00Z`, confirmed real end).
+New entries stop at **18:50 UTC** (T-90, `guardrails.flatten_no_entry_min`); the engine force-flattens
+everything to TMN from **19:45 UTC** (T-35, `guardrails.flatten_force_min`). `wallexer status` prints
+these three times on the "Schedule" line.
 The engine is **flat by design** unless a strategy passes the walk-forward OOS gate and shadow.
 
 ## 0. Before going live (once)
@@ -20,7 +22,7 @@ Deploy from a clean staging copy (no `.env`, no DB): see `deploy` section of the
 liara disk create -a wallexer --team-id $T -n data -s 1   # done 2026-10-22
 # secrets: run these yourself (never commit them, never paste them into chat)
 liara env set -a wallexer --team-id $T WALLEX_API_KEY=... WALLEX_SUBACCOUNT_ID=... BOXAPI_API_KEY=...
-liara env set -a wallexer --team-id $T EVENT_END_UTC=2026-10-23T20:00:00Z WALLEXER_MODE=shadow
+liara env set -a wallexer --team-id $T EVENT_END_UTC=2026-10-23T20:20:00Z WALLEXER_MODE=shadow
 liara deploy --app wallexer --team-id $T --port 8000 --build-location iran --disks data:/app/data --no-app-logs
 ```
 Container start (`deploy/entrypoint.sh`): seed `not_allowed.txt` onto the disk → `doctor --quick`
@@ -73,7 +75,7 @@ Also attach the local `data/reports/*.md` and `wallexer research spread` output.
 - The engine reconciles balances and open orders from Wallex first (exchange = source of truth).
 - Later starts don't need TMN ≈ 5M; they report equity/drawdown vs 5M.
 - A **hard stop persists** across restarts until `wallexer resume`.
-- During T-30 → end, the flatten phase is re-detected on start and continues.
+- During T-35 → end (19:45–20:20 UTC), the flatten phase is re-detected on start and continues.
 - Walk-forward reruns every 12 h in the background; the agent re-plans after ~90 s.
 - Check `wallexer log` for `engine.*`, `risk.*`, `backtest.*` events.
 
@@ -91,4 +93,14 @@ Also attach the local `data/reports/*.md` and `wallexer research spread` output.
   Likely cause: `/markets` → `fair_price.spot` = {threshold 4, max_acceptable_buy 8, max_acceptable_sell 8}
   for BTCTMN (USDTTMN: 3/4/4), i.e. limit prices must stay within a few % of the fair price
   (undocumented; inferred). Re-run inside the band: `wallexer doctor --live-smoke --discount-pct 3.5`.
-- value-vs-locked: pending (needs an accepted resting order).
+- 2026-10-22 ~18:30 UTC, `wx-smoke9-1`/`wx-smoke10-1`: with the MAIN account's key the POST hit the
+  main account (422, error_code 1006, quantity: "موجودی شما کافی نیست. موجودی شما 0 تومان می باشد").
+  The `sub-account-client-id` header switches reads, not order placement. Fixed by a key created inside
+  the trading-credit account. Next run placed the order, then a parse error on `fills` triggered the
+  recovery cancel (verified CANCELED, executed 0). Models made tolerant; raw responses kept.
+- **2026-10-22 20:02 UTC, `wx-smoke11-1` (decision #11): PASSED, all 12 steps.** BUY 0.00000469 BTC @
+  21,330,388,556 (-3.5% vs best bid 22,104,029,592), notional 100,040 TMN; placed (NEW, active), found by
+  get_order and openOrders, cancelled (CANCELED, executed 0), gone from openOrders, balances restored,
+  timeout lookup path OK. Nothing filled, cost 0.
+- **value vs locked (settled):** while the order was open `value` stayed 5,000,000 and `locked` rose to
+  100,039, so `value` is the TOTAL. Equity = value (coins at best bid); free = value − locked.
