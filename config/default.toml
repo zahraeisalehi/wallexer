@@ -1,0 +1,84 @@
+# wallexer defaults. Runtime-learned values (e.g. min order value) go to data/overrides.toml,
+# which is layered on top of this file. Secrets come only from env / .env.
+
+[exchange]
+base_url = "https://api.wallex.ir"
+timeout_s = 10.0
+# Order placement gets its own (longer) timeout: a timeout means "status unknown", not "failed".
+order_timeout_s = 15.0
+get_retries = 3
+backoff_base_s = 0.5
+
+[ratelimit.market]
+# The exchange reports x-ratelimit-limit/remaining but not the window length.
+# `wallexer doctor` measures it; until then assume 60 s.
+window_s = 60.0
+backoff_below_frac = 0.10
+
+[ratelimit.orders]
+# Exchange rule: max 20 order requests (create + cancel) per 10 s. We cap at 15 for headroom.
+max_requests = 15
+window_s = 10.0
+# Queue depth (waiting requests) at which a risk event is logged.
+backlog_warn = 5
+
+[account]
+# Trading-credit (sub) account starts with ~5M TMN. Equity (TMN + coins at best bid) must be
+# within this tolerance or shadow/trade refuse to start.
+expected_equity_tmn = "5000000"
+equity_tolerance_pct = "10"
+
+[orders]
+# PLACEHOLDER: the spot minimum is not documented. Live trading is allowed with it, doctor warns.
+# When the exchange rejects a too-small order, the real minimum is parsed and written to
+# data/overrides.toml with verified = true.
+min_order_value_tmn = "100000"
+min_order_verified = false
+# New positions must be at least this multiple of the minimum, so a position that loses value
+# can still be sold in full (positions are never left below the minimum).
+min_entry_multiple = "2.0"
+# Exits (stop-loss, final flatten) on markets where MARKET orders are disabled
+# (is_market_type_enable = false) use an aggressive LIMIT this far past the best opposite price,
+# re-priced if still unfilled after exit_reprice_after_s.
+exit_limit_slippage_pct = "0.5"
+exit_reprice_after_s = 10
+exit_max_reprices = 5
+
+[fees]
+# Fallback rates when /v1/account/fee has no usable entry for a market. Set to the highest
+# observed tier (0.25%/0.30%, rounded up to 0.30% both) so a fallback never understates costs.
+# Markets priced with these are marked source = "default" and doctor shows a warning.
+default_maker = "0.003"
+default_taker = "0.003"
+
+[universe]
+top_n = 30
+min_quote_volume_tmn = "500000000"
+max_spread_bps = "100"
+quote_assets = ["TMN", "USDT"]
+not_allowed_path = "data/not_allowed.txt"
+
+[llm]
+base_url = "https://ai.boxapi.ir/ai/v1"
+model = "gpt-5.4-mini"
+fallback_model = "gpt-5.4-mini"
+timeout_s = 30.0
+
+[guardrails]
+max_position_pct = "20"
+max_exposure_pct = "60"
+max_order_pct = "10"
+stop_loss_atr_mult = "2"
+stop_loss_max_pct = "2"
+daily_dd_soft_pct = "4"
+soft_stop_pause_min = 30
+total_dd_hard_pct = "8"
+max_consecutive_losses = 4
+loss_cooldown_min = 60
+max_open_orders = 10
+flatten_no_entry_min = 90
+flatten_force_min = 30
+
+[store]
+db_path = "data/wallexer.db"
+overrides_path = "data/overrides.toml"
