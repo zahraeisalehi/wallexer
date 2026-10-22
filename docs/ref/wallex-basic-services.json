@@ -1,0 +1,738 @@
+{
+ "swagger": "2.0",
+ "info": {
+  "description": "Wallex basic services (market data, balances, fees, candles). Trimmed: withdrawal/IBAN/card/wallet endpoints removed; the bot must never call them. Orders are in wallex-spot-trading.json.",
+  "title": "Spot",
+  "version": "1.0",
+  "contact": {}
+ },
+ "host": "api.wallex.com",
+ "basePath": "/",
+ "schemes": [
+  "https"
+ ],
+ "paths": {
+  "/v1/account/fee": {
+   "get": {
+    "operationId": "getAccountFees",
+    "summary": "دریافت کارمزدهای حساب",
+    "description": "این API نرخ‌های کارمزد میکر و تیکر را برای هر بازار به همراه مجموع حجم معاملات چند روز اخیر باز می‌گرداند. نیازمند API Key در هدر است.",
+    "tags": [
+     "basic-services"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "پاسخ موفق",
+      "schema": {
+       "$ref": "#/definitions/AccountFeeResponse"
+      },
+      "examples": {
+       "application/json": {
+        "success": true,
+        "message": "عملیات با موفقیت انجام شد",
+        "result": {
+         "BTCTMN": {
+          "makerFeeRate": "0.00200000",
+          "takerFeeRate": "0.00200000",
+          "recent_days_sum": 250000000.0
+         },
+         "BTCUSDT": {
+          "makerFeeRate": "0.00200000",
+          "takerFeeRate": "0.00200000",
+          "recent_days_sum": 0
+         }
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  },
+  "/v1/trades": {
+   "get": {
+    "operationId": "getLatestTrades",
+    "summary": "دریافت معاملات اخیر",
+    "description": "این API آخرین معاملات انجام‌شده برای نماد مشخص‌شده را برمی‌گرداند.",
+    "tags": [
+     "basic-services"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "parameters": [
+     {
+      "name": "symbol",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "example": "USDCUSDT",
+      "description": "نماد معاملاتی مورد نظر"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "پاسخ موفق",
+      "schema": {
+       "$ref": "#/definitions/LatestTradesResponse"
+      },
+      "examples": {
+       "application/json": {
+        "result": {
+         "latestTrades": [
+          {
+           "symbol": "USDCUSDT",
+           "quantity": "500.0000000000000000",
+           "price": "1.0000000000000000",
+           "sum": "500.0000000000000000",
+           "isBuyOrder": false,
+           "timestamp": "2025-06-09T13:40:05Z"
+          },
+          {
+           "symbol": "USDCUSDT",
+           "quantity": "13.6300000000000000",
+           "price": "0.9944000000000000",
+           "sum": "13.5536720000000000",
+           "isBuyOrder": true,
+           "timestamp": "2025-06-09T10:22:12Z"
+          }
+         ]
+        },
+        "message": "The operation was successful",
+        "success": true
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  },
+  "/hector/web/v1/markets": {
+   "get": {
+    "operationId": "getMarkets",
+    "description": "Retrieve  all markets",
+    "consumes": [
+     "application/json"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "tags": [
+     "basic-services"
+    ],
+    "summary": "Get all markets ",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "schema": {
+       "$ref": "#/definitions/resources.allMarkets"
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  },
+  "/v1/depth": {
+   "get": {
+    "operationId": "getMarketDepth",
+    "summary": "دریافت عمق بازار",
+    "description": "این API، لیست سفارشات خرید (bid) و فروش (ask) را برای یک نماد خاص برمی‌گرداند.",
+    "tags": [
+     "basic-services"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "parameters": [
+     {
+      "name": "symbol",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "example": "USDCUSDT",
+      "description": "نماد معاملاتی مورد نظر"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "پاسخ موفق",
+      "schema": {
+       "$ref": "#/definitions/MarketDepthResponse"
+      },
+      "examples": {
+       "application/json": {
+        "result": {
+         "ask": [
+          {
+           "price": 1,
+           "quantity": 24.79,
+           "sum": "24.79"
+          },
+          {
+           "price": 1.0045,
+           "quantity": 314.37,
+           "sum": "315.784665"
+          }
+         ],
+         "bid": [
+          {
+           "price": 0.9944,
+           "quantity": 317.57,
+           "sum": "315.791608"
+          },
+          {
+           "price": 0.9869,
+           "quantity": 479.97,
+           "sum": "473.682393"
+          }
+         ]
+        },
+        "message": "عملیات موفقیت‌آمیز بود.",
+        "success": true
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  },
+  "/v1/account/balances": {
+   "get": {
+    "operationId": "getAccountBalances",
+    "summary": "Get account balances",
+    "description": "Retrieve the list of all account balances. Requires API key.",
+    "tags": [
+     "basic-services"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "parameters": [],
+    "responses": {
+     "200": {
+      "description": "Successful response",
+      "schema": {
+       "$ref": "#/definitions/AccountBalancesResponse"
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  },
+  "/v1/udf/history": {
+   "get": {
+    "operationId": "candleHistory",
+    "summary": "Get historical market data (candles)",
+    "description": "Retrieve historical OHLCV data for a symbol. Useful for charting and analysis.",
+    "tags": [
+     "basic-services"
+    ],
+    "produces": [
+     "application/json"
+    ],
+    "parameters": [
+     {
+      "name": "symbol",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "example": "BTCTMN",
+      "description": "The symbol to retrieve historical data for"
+     },
+     {
+      "name": "resolution",
+      "in": "query",
+      "required": true,
+      "type": "string",
+      "example": "60",
+      "description": "Candle resolution (e.g. 1, 5, 15, 60, D)"
+     },
+     {
+      "name": "from",
+      "in": "query",
+      "required": true,
+      "type": "integer",
+      "format": "int64",
+      "example": 1733425200,
+      "description": "Start of time range (Unix timestamp)"
+     },
+     {
+      "name": "to",
+      "in": "query",
+      "required": true,
+      "type": "integer",
+      "format": "int64",
+      "example": 1733428800,
+      "description": "End of time range (Unix timestamp)"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful response",
+      "schema": {
+       "$ref": "#/definitions/MarketHistoryResponse"
+      },
+      "examples": {
+       "application/json": {
+        "s": "ok",
+        "t": [
+         1733425200,
+         1733428800
+        ],
+        "c": [
+         "7209722048.0000000000000000",
+         "7235725819.0000000000000000"
+        ],
+        "o": [
+         "7286137604.0000000000000000",
+         "7200151050.0000000000000000"
+        ],
+        "h": [
+         "7286137604.0000000000000000",
+         "7235725819.0000000000000000"
+        ],
+        "l": [
+         "7209722048.0000000000000000",
+         "7150000001.0000000000000000"
+        ],
+        "v": [
+         "0.2544820000000000",
+         "1.0201680000000000"
+        ]
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKeyAuth": []
+     }
+    ]
+   }
+  }
+ },
+ "definitions": {
+  "AccountFeeResponse": {
+   "type": "object",
+   "properties": {
+    "success": {
+     "type": "boolean",
+     "example": true
+    },
+    "message": {
+     "type": "string",
+     "example": "عملیات با موفقیت انجام شد"
+    },
+    "result": {
+     "type": "object",
+     "additionalProperties": {
+      "$ref": "#/definitions/FeeItem"
+     }
+    }
+   }
+  },
+  "FeeItem": {
+   "type": "object",
+   "properties": {
+    "makerFeeRate": {
+     "type": "string",
+     "example": "0.00200000"
+    },
+    "takerFeeRate": {
+     "type": "string",
+     "example": "0.00200000"
+    },
+    "recent_days_sum": {
+     "type": "number",
+     "format": "double",
+     "example": 250000000.0
+    }
+   }
+  },
+  "LatestTradesResponse": {
+   "type": "object",
+   "properties": {
+    "result": {
+     "type": "object",
+     "properties": {
+      "latestTrades": {
+       "type": "array",
+       "items": {
+        "$ref": "#/definitions/TradeEntry"
+       }
+      }
+     }
+    },
+    "message": {
+     "type": "string",
+     "example": "The operation was successful"
+    },
+    "success": {
+     "type": "boolean",
+     "example": true
+    }
+   }
+  },
+  "TradeEntry": {
+   "type": "object",
+   "properties": {
+    "symbol": {
+     "type": "string",
+     "example": "USDCUSDT"
+    },
+    "quantity": {
+     "type": "string",
+     "example": "500.0000000000000000"
+    },
+    "price": {
+     "type": "string",
+     "example": "1.0000000000000000"
+    },
+    "sum": {
+     "type": "string",
+     "example": "500.0000000000000000"
+    },
+    "isBuyOrder": {
+     "type": "boolean",
+     "example": false
+    },
+    "timestamp": {
+     "type": "string",
+     "format": "date-time",
+     "example": "2025-06-09T13:40:05Z"
+    }
+   }
+  },
+  "MarketDepthResponse": {
+   "type": "object",
+   "properties": {
+    "result": {
+     "type": "object",
+     "properties": {
+      "ask": {
+       "type": "array",
+       "items": {
+        "$ref": "#/definitions/OrderBookEntry"
+       }
+      },
+      "bid": {
+       "type": "array",
+       "items": {
+        "$ref": "#/definitions/OrderBookEntry"
+       }
+      }
+     }
+    },
+    "message": {
+     "type": "string",
+     "example": "عملیات موفقیت‌آمیز بود."
+    },
+    "success": {
+     "type": "boolean",
+     "example": true
+    }
+   }
+  },
+  "OrderBookEntry": {
+   "type": "object",
+   "properties": {
+    "price": {
+     "type": "number",
+     "example": 1.0045
+    },
+    "quantity": {
+     "type": "number",
+     "example": 314.37
+    },
+    "sum": {
+     "type": "string",
+     "example": "315.784665"
+    }
+   }
+  },
+  "resources.allMarkets": {
+   "type": "object",
+   "properties": {
+    "success": {
+     "type": "boolean",
+     "example": true
+    },
+    "message": {
+     "type": "string",
+     "example": "The operation was successful"
+    },
+    "result": {
+     "type": "object",
+     "properties": {
+      "markets": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "properties": {
+         "symbol": {
+          "type": "string"
+         },
+         "base_asset": {
+          "type": "string"
+         },
+         "quote_asset": {
+          "type": "string"
+         },
+         "fa_base_asset": {
+          "type": "string"
+         },
+         "fa_quote_asset": {
+          "type": "string"
+         },
+         "en_base_asset": {
+          "type": "string"
+         },
+         "en_quote_asset": {
+          "type": "string"
+         },
+         "categories": {
+          "type": "array",
+          "items": {
+           "type": "integer"
+          }
+         },
+         "price": {
+          "type": "string"
+         },
+         "change_24h": {
+          "type": "number",
+          "format": "float"
+         },
+         "volume_24h": {
+          "type": "number",
+          "format": "float"
+         },
+         "change_7D": {
+          "type": "number",
+          "format": "float"
+         },
+         "quote_volume_24h": {
+          "type": "number",
+          "format": "float"
+         },
+         "spot_is_new": {
+          "type": "boolean"
+         },
+         "otc_is_new": {
+          "type": "boolean"
+         },
+         "is_new": {
+          "type": "boolean"
+         },
+         "is_spot": {
+          "type": "boolean"
+         },
+         "is_otc": {
+          "type": "boolean"
+         },
+         "is_margin": {
+          "type": "boolean"
+         },
+         "is_tmn_based": {
+          "type": "boolean"
+         },
+         "is_usdt_based": {
+          "type": "boolean"
+         },
+         "is_zero_fee": {
+          "type": "boolean"
+         },
+         "leverage_step": {
+          "type": "number",
+          "format": "float"
+         },
+         "max_leverage": {
+          "type": "number"
+         },
+         "created_at": {
+          "type": "string",
+          "format": "date-time"
+         },
+         "amount_precision": {
+          "type": "integer"
+         },
+         "price_precision": {
+          "type": "integer"
+         },
+         "flags": {
+          "type": "array",
+          "items": {}
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "AccountBalanceItem": {
+   "type": "object",
+   "properties": {
+    "asset": {
+     "type": "string",
+     "example": "1BBABYDOGE"
+    },
+    "asset_png_icon": {
+     "type": "string",
+     "format": "uri"
+    },
+    "asset_svg_icon": {
+     "type": "string",
+     "format": "uri"
+    },
+    "faName": {
+     "type": "string",
+     "example": "۱میلیارد بیبی دوج"
+    },
+    "fiat": {
+     "type": "boolean"
+    },
+    "value": {
+     "type": "string",
+     "example": "13.97200000"
+    },
+    "locked": {
+     "type": "string",
+     "example": "0.00000000"
+    },
+    "is_dust": {
+     "type": "boolean"
+    },
+    "is_digital_gold": {
+     "type": "boolean"
+    }
+   }
+  },
+  "AccountBalancesResponse": {
+   "type": "object",
+   "properties": {
+    "result": {
+     "type": "object",
+     "properties": {
+      "balances": {
+       "type": "object",
+       "additionalProperties": {
+        "$ref": "#/definitions/AccountBalanceItem"
+       }
+      }
+     }
+    },
+    "message": {
+     "type": "string",
+     "example": "عملیات با موفقیت انجام شد"
+    },
+    "success": {
+     "type": "boolean",
+     "example": true
+    }
+   }
+  },
+  "MarketHistoryResponse": {
+   "type": "object",
+   "properties": {
+    "s": {
+     "type": "string",
+     "example": "ok"
+    },
+    "t": {
+     "type": "array",
+     "items": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "example": [
+      1733425200,
+      1733428800
+     ]
+    },
+    "c": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "example": [
+      "7209722048.0000000000000000",
+      "7235725819.0000000000000000"
+     ]
+    },
+    "o": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "example": [
+      "7286137604.0000000000000000",
+      "7200151050.0000000000000000"
+     ]
+    },
+    "h": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "example": [
+      "7286137604.0000000000000000",
+      "7235725819.0000000000000000"
+     ]
+    },
+    "l": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "example": [
+      "7209722048.0000000000000000",
+      "7150000001.0000000000000000"
+     ]
+    },
+    "v": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "example": [
+      "0.2544820000000000",
+      "1.0201680000000000"
+     ]
+    }
+   }
+  }
+ },
+ "securityDefinitions": {
+  "ApiKeyAuth": {
+   "type": "apiKey",
+   "in": "header",
+   "name": "x-api-key",
+   "description": "Use your API key to authenticate requests."
+  }
+ }
+}

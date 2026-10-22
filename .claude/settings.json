@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Bash(cat .env*)",
+      "Bash(printenv*)",
+      "Bash(env)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(liara deploy:*)",
+      "Bash(liara env:*)",
+      "Bash(uv run wallexer trade:*)",
+      "Bash(uv run wallexer change:*)",
+      "Bash(uv run wallexer flatten:*)"
+    ]
+  }
+}
