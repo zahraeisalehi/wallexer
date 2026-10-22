@@ -89,6 +89,29 @@ class Universe:
     def rules(self) -> dict[str, MarketRules]:
         return {e.market.symbol: e.rules for e in self.candidates}
 
+    @property
+    def usdt_conversion_bps(self) -> Decimal | None:
+        """Cost of one TMN→USDT→TMN inventory cycle via USDTTMN, in bps of the converted amount.
+
+        Buying USDT and selling it back is exactly a USDTTMN round trip (2 x taker + spread).
+        It is paid once per inventory cycle (an allocator decision), not per USDT-market trade.
+        """
+        for e in self.candidates:
+            if e.market.symbol == USDT_TMN:
+                return e.round_trip_bps
+        return None
+
+    def round_trip_incl_conversion_bps(self, e: UniverseEntry) -> Decimal | None:
+        """USDT markets only: per-trade round trip + one full conversion cycle.
+
+        Worst case (a single trade per cycle). With several trades per cycle the conversion is
+        shared, so the real per-trade cost lies between round_trip_bps and this value.
+        """
+        if e.market.quote_asset != "USDT":
+            return None
+        rt, conv = e.round_trip_bps, self.usdt_conversion_bps
+        return None if rt is None or conv is None else rt + conv
+
 
 def usdt_tmn_price(markets: list[Market], books: dict[str, Book] | None = None) -> Decimal | None:
     if books and (b := books.get(USDT_TMN)) and b.best_bid and b.best_ask:

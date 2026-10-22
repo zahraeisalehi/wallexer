@@ -48,6 +48,15 @@ Initial strategy set (each is small; quality over count):
 - Baseline weights = softmax(score / τ), with floor 0, cap `max_strategy_weight`, and weight 0 if the strategy is in its own drawdown stop.
 - Regime model (HMM or vol/trend classifier) multiplies weights by regime fit.
 
+### USDT inventory (allocator decision, not a per-trade cost)
+USDT-quoted markets are the cheap fee tier (0.10/0.13% vs 0.25/0.30% on TMN), but trading them requires holding USDT, bought with TMN on USDTTMN and sold back before the end. That conversion is a **separate decision** made by the allocator, not by each trade.
+- **Cost of one cycle** (TMN→USDT→TMN) = USDTTMN round trip = 2 × USDTTMN taker + USDTTMN spread, in bps of the converted amount (`Universe.usdt_conversion_bps`; ≈ 60 bps on 2026-10-22). Break-even vs TMN markets at about 2 USDT-market trades per cycle (≈29 + 60/k bps per trade vs ≈64–84).
+- **Target USDT inventory** (fraction of equity) = Σ over USDT-quoted strategies of (strategy weight × expected USDT-market exposure), from their recent paper activity. Zero if the expected trades per cycle are below break-even.
+- **Hysteresis:** convert only when |target − current| > `usdt_rebalance_band_pct` of equity and the last conversion is older than `usdt_min_hold_min`, so the inventory is not churned. Each conversion is a USDTTMN order with its own decision row (action `usdt_inventory`, inputs: target, current, expected trades/cycle, conversion bps).
+- **Risk:** USDT counts as non-TMN exposure in the risk gate. End-of-event flatten sells all USDT to TMN (unchanged).
+- **Paper PnL:** the conversion cost is charged **once per cycle** to the USDT-quoted strategies, pro rata to their USDT usage (time-weighted notional) during the cycle. While a cycle is open, the not-yet-paid sell-back leg is accrued as unrealized cost, so paper equity is never overstated. USDT/TMN price moves on the idle inventory go to a separate `usdt_inventory` line on the scoreboard (an allocator decision, not a strategy's edge).
+- **Universe ranking** stays per-trade (round trip without conversion); `wallexer markets` also shows "RT incl. USDT conv" (round trip + one full cycle, worst case) for USDT markets.
+
 ### LLM agent (the "AI substantively changes decisions" part)
 Every `agent_interval_min` (and on risk events) the agent receives a compact JSON snapshot:
 scoreboard, regime probabilities, per-market spread/vol/volume, current exposure, drawdown, recent errors.
