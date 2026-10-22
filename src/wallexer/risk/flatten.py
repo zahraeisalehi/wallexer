@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from wallexer.exchange.models import Book, Side
-from wallexer.exchange.rules import MarketRules, OrderRuleError, OrderSpec, choose_exit_order
+from wallexer.exchange.rules import (
+    FairBand,
+    MarketRules,
+    OrderRuleError,
+    OrderSpec,
+    choose_exit_order,
+)
 
 ZERO = Decimal(0)
 
@@ -62,6 +68,7 @@ def plan_flatten(
     slippage_pct: Decimal,
     blocked: frozenset[str] = frozenset(),
     only_assets: frozenset[str] | None = None,
+    bands: Mapping[str, FairBand] | None = None,
 ) -> FlattenPlan:
     """`balances`: free quantity per asset (cancel open orders first)."""
     plan = FlattenPlan()
@@ -107,6 +114,7 @@ def plan_flatten(
                     decision_id=decision_id,
                     n=n,
                     slippage_pct=slippage_pct,
+                    band=(bands or {}).get(r.symbol),
                 )
             )
         except OrderRuleError:

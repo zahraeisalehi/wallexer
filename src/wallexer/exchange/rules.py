@@ -169,8 +169,24 @@ def exit_quantity(
     return q
 
 
-def aggressive_price(rules: MarketRules, side: Side, book: Book, slippage_pct: Decimal) -> Decimal:
-    """LIMIT price `slippage_pct` past the best opposite price, so it fills immediately."""
+@dataclass(frozen=True)
+class FairBand:
+    """Exchange fair price and the max distance (%) our exit LIMITs may go from it.
+
+    Wallex rejects limit prices far from its fair price (`/markets` → fair_price.spot; a BUY 20%
+    below was rejected live). max_pct = min(our cap, 4%; the market's own spot threshold).
+    """
+
+    fair: Decimal
+    max_pct: Decimal
+
+
+def aggressive_price(
+    rules: MarketRules, side: Side, book: Book, slippage_pct: Decimal, band: FairBand | None = None
+) -> Decimal:
+    """LIMIT price `slippage_pct` past the best opposite price, so it fills immediately; never
+    further than band.max_pct from the fair price (a SELL never below fair x (1 - max), a BUY never
+    above fair x (1 + max)), even after repeated re-pricing in a falling book."""
     slip = slippage_pct / Decimal(100)
     if side is Side.SELL:
         if book.best_bid is None:
@@ -181,6 +197,15 @@ def aggressive_price(rules: MarketRules, side: Side, book: Book, slippage_pct: D
             raise OrderRuleError(f"{rules.symbol}: no asks to buy from")
         raw = book.best_ask * (1 + slip)
     p = rules.round_price(raw, side, crossing=True)
+    if band is not None and band.fair > 0:
+        dev = band.max_pct / Decimal(100)
+        if side is Side.SELL:
+            # round the floor UP so the clamped price stays inside the band
+            floor = (band.fair * (1 - dev)).quantize(rules.price_step, rounding=ROUND_CEILING)
+            p = max(p, floor)
+        else:
+            cap = (band.fair * (1 + dev)).quantize(rules.price_step, rounding=ROUND_FLOOR)
+            p = min(p, cap)
     if p <= 0:
         raise OrderRuleError(f"{rules.symbol}: aggressive price rounds to zero")
     return p
@@ -195,8 +220,10 @@ def choose_exit_order(
     decision_id: str | int,
     n: int,
     slippage_pct: Decimal,
+    band: FairBand | None = None,
 ) -> OrderSpec:
-    """Exit order (stop-loss / flatten): MARKET where allowed, else an aggressive LIMIT.
+    """Exit order (stop-loss / flatten): MARKET where allowed, else an aggressive LIMIT
+    (clamped to the fair-price band).
 
     No local min-value check here: the minimum is an unverified estimate and an exit must never
     be blocked by it. The exchange is the authority; a rejection is learned from.
@@ -207,7 +234,7 @@ def choose_exit_order(
     cid = make_client_id(decision_id, n)
     if rules.market_orders_enabled:
         return OrderSpec(rules.symbol, side, OrderType.MARKET, q, None, cid, str(decision_id))
-    price = aggressive_price(rules, side, book, slippage_pct)
+    price = aggressive_price(rules, side, book, slippage_pct, band)
     return OrderSpec(rules.symbol, side, OrderType.LIMIT, q, price, cid, str(decision_id))
 
 
@@ -226,6 +253,7 @@ def reprice_exit(
     attempt: int,
     slippage_pct: Decimal,
     max_reprices: int,
+    band: FairBand | None = None,
 ) -> RepriceDecision:
     """Replacement for an unfilled aggressive exit, after it was cancelled and re-read.
 
@@ -237,7 +265,7 @@ def reprice_exit(
     remaining = rules.round_qty(prev.remaining_qty)
     if remaining <= 0:
         return RepriceDecision(None, False)
-    price = aggressive_price(rules, side, book, slippage_pct)
+    price = aggressive_price(rules, side, book, slippage_pct, band)
     spec = OrderSpec(
         rules.symbol,
         side,

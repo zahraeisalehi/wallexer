@@ -67,6 +67,23 @@ class Market(_Model):
     # Undocumented field, confirmed by the user: false = MARKET order type disabled on this market.
     # The market itself stays tradable (unrelated to not_allowed.txt).
     market_orders_enabled: bool = Field(default=True, alias="is_market_type_enable")
+    # Undocumented: {"ask", "bid", "spot": {"threshold", "max_acceptable_buy", ...}, ...}
+    fair_price: dict[str, Any] | None = None
+
+    def fair_band(self, cap_pct: Decimal) -> tuple[Decimal, Decimal] | None:
+        """(fair mid, allowed % distance = min(cap, spot threshold)) or None if not provided."""
+        fp = self.fair_price or {}
+        try:
+            mid = (Decimal(str(fp["bid"])) + Decimal(str(fp["ask"]))) / 2
+        except (KeyError, ArithmeticError, TypeError, ValueError):
+            return None
+        pct = cap_pct
+        try:
+            thr = Decimal(str((fp.get("spot") or {}).get("threshold")))
+            pct = min(pct, thr) if thr > 0 else pct
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+        return (mid, pct) if mid > 0 else None
 
 
 class DepthLevel(_Model):

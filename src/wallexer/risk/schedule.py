@@ -30,3 +30,21 @@ def phase(
 
 def entries_allowed(p: Phase) -> bool:
     return p in (Phase.normal, Phase.unknown)
+
+
+def times(
+    end: float | None, no_entry_before_s: float, flatten_before_s: float
+) -> dict[str, str | None]:
+    """ISO UTC times of the schedule boundaries (for status/RUNBOOK)."""
+    from datetime import UTC, datetime
+
+    def iso(ts: float) -> str:
+        return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+    if end is None:
+        return {"entries_stop": None, "flatten_from": None, "end": None}
+    return {
+        "entries_stop": iso(end - no_entry_before_s),
+        "flatten_from": iso(end - flatten_before_s),
+        "end": iso(end),
+    }

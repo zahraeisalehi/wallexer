@@ -100,7 +100,15 @@ Used by: Claude Code during development (public/read-only), and the LLM agent at
 `/hector/web/v1/markets` → `fair_price: {ask, bid, spot: {threshold, max_acceptable_buy, max_acceptable_sell}, ...}`
 (BTCTMN/ETHTMN 4 / 8 / 8, USDTTMN 3 / 4 / 4). A LIMIT BUY 20% below the best bid on BTCTMN was rejected
 with "اطلاعات وارد شده اشتباه است" (2026-10-22). Working assumption: limit prices must lie within these
-percentages of the fair price. Our exit LIMITs (0.5% through the book) are well inside it.
+percentages of the fair price. A BUY 3.5% below the best bid was accepted (smoke test 2026-10-22).
+**Exit rule:** aggressive exit/flatten LIMITs (0.5% through the book, re-priced every 10 s) are clamped
+to at most `orders.exit_max_fair_deviation_pct` (4%) from the fair price, or the market's own
+`spot.threshold` if lower (USDTTMN 3%); fair prices are re-read from `/markets` every minute. MARKET
+orders carry no price, so the clamp cannot apply to them (the exchange's own band governs those).
+
+## Balances: value vs locked (verified 2026-10-22)
+`value` is the TOTAL balance including funds locked in open orders (`locked` is a subset). Equity uses
+`value` only; available = `value − locked`.
 
 ## Sub-account header: reads vs orders (verified 2026-10-22)
 With the MAIN account's key, `GET /v1/account/balances` returns the trading-credit balance (5,000,000 TMN)

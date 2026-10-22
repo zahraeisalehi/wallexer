@@ -68,6 +68,9 @@ class OrdersCfg(BaseModel):
     exit_limit_slippage_pct: Decimal = Decimal("0.5")
     exit_reprice_after_s: float = 10
     exit_max_reprices: int = 5
+    # Exit LIMITs never go further than this % from the exchange fair price (or the market's
+    # own spot threshold if lower; Wallex rejects prices outside its band).
+    exit_max_fair_deviation_pct: Decimal = Decimal("4")
     # A remainder below this (TMN value) after a full sell is accepted as dust and logged.
     dust_cap_tmn: Decimal = Decimal("1000")
 
@@ -124,7 +127,7 @@ class GuardrailsCfg(BaseModel):
     loss_cooldown_min: int = 60
     max_open_orders: int = 10
     flatten_no_entry_min: int = 90
-    flatten_force_min: int = 30
+    flatten_force_min: int = 35  # force flatten from T-35 min (event end 20:20 UTC → 19:45)
 
 
 class EngineCfg(BaseModel):

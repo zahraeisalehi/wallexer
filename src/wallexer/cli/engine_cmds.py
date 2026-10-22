@@ -104,7 +104,7 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     t.add_row("Drawdown", f"{st['drawdown_pct']}%", "Exposure", f"{int(st['exposure_tmn']):,} TMN")
     t.add_row(
         "Phase",
-        f"{st['phase']} (end {st.get('event_end_utc')})",
+        f"{st['phase']}",
         "Open orders",
         str(st["open_orders"]),
     )
@@ -117,6 +117,13 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
         ", ".join(f"{k} {v}" for k, v in st["positions"].items()) or "none",
     )
     console.print(t)
+    sch = st.get("schedule") or {}
+    if sch.get("end"):
+        console.print(
+            f"[bold]Schedule[/]: entries stop {sch['entries_stop']} · flatten {sch['flatten_from']} · end {sch['end']}"
+        )
+    else:
+        console.print("[yellow]Schedule: EVENT_END_UTC not set: no entry stop, no auto-flatten[/]")
     if st.get("flat_by_design"):
         console.print("[bold cyan]flat by design: no strategy has proven edge yet[/]")
 
