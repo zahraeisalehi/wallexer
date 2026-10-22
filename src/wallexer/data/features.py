@@ -18,7 +18,7 @@ from wallexer.exchange.models import Book
 BPS = Decimal(10000)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MarketFeatures:
     symbol: str
     ts: float
@@ -30,7 +30,7 @@ class MarketFeatures:
     book_issue: str | None
     quote: str
     last_close: float | None = None
-    ret_1m: float | None = None
+    ret_1m: float | None = None  # 1/5/15-BAR returns (named for the 1-min timeframe)
     ret_5m: float | None = None
     ret_15m: float | None = None
     atr: float | None = None  # in price units
@@ -44,6 +44,7 @@ class MarketFeatures:
     imbalance: float | None = None  # (bid qty - ask qty) / total, top 5 levels
     ema_fast: float | None = None
     ema_slow: float | None = None
+    timeframe: int = 1  # minutes per bar the candle indicators were computed on
 
     @property
     def mid(self) -> Decimal:
@@ -96,6 +97,28 @@ def imbalance(book: Book, levels: int = 5) -> float | None:
     return (bq - aq) / (bq + aq) if bq + aq > 0 else None
 
 
+WINDOW = (
+    130  # bars an evaluation looks back at (>= longest indicator window + 1); same live/backtest
+)
+
+
+class FloatBars:
+    """Bar series as float lists, converted once (the backtest reuses it for every step)."""
+
+    __slots__ = ("t", "o", "h", "l", "c", "v")
+
+    def __init__(self, bars: Sequence[Bar]) -> None:
+        self.t = [b.t for b in bars]
+        self.o = [float(b.o) for b in bars]
+        self.h = [float(b.h) for b in bars]
+        self.l = [float(b.l) for b in bars]  # noqa: E741
+        self.c = [float(b.c) for b in bars]
+        self.v = [float(b.v) for b in bars]
+
+    def __len__(self) -> int:
+        return len(self.c)
+
+
 def _ema(values: Sequence[float], n: int) -> float | None:
     if len(values) < n:
         return None
@@ -106,14 +129,96 @@ def _ema(values: Sequence[float], n: int) -> float | None:
     return e
 
 
-def _atr(bars: Sequence[Bar], n: int) -> float | None:
-    if len(bars) < n + 1:
-        return None
-    trs = []
-    for prev, b in zip(bars[-n - 1 : -1], bars[-n:], strict=True):
-        h, lo, pc = float(b.h), float(b.l), float(prev.c)
-        trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
-    return sum(trs) / n
+def _indicators(
+    fb: FloatBars, end: int, mid: float, vwap_bars: int, breakout_bars: int, atr_bars: int
+) -> dict[str, float | None]:
+    """All candle indicators for the bars fb[:end] (only the last WINDOW bars are used)."""
+    start = max(0, end - WINDOW)
+    c, h, lo, v = fb.c, fb.h, fb.l, fb.v
+    n = end - start
+    f: dict[str, float | None] = {}
+    if n <= 0:
+        return f
+    f["last_close"] = c[end - 1]
+    for k, m in (("ret_1m", 1), ("ret_5m", 5), ("ret_15m", 15)):  # 1/5/15-bar returns
+        f[k] = (mid / c[end - 1 - m] - 1) if n > m and c[end - 1 - m] > 0 else None
+    if n >= 31:
+        rets = [c[j] / c[j - 1] - 1 for j in range(end - 30, end) if c[j - 1] > 0]
+        if len(rets) > 2:
+            mu = sum(rets) / len(rets)
+            f["vol_bps"] = math.sqrt(sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)) * 1e4
+    if n >= atr_bars + 1 and mid > 0:
+        trs = [
+            max(h[j] - lo[j], abs(h[j] - c[j - 1]), abs(lo[j] - c[j - 1]))
+            for j in range(end - atr_bars, end)
+        ]
+        atr = sum(trs) / atr_bars
+        f["atr"], f["atr_bps"] = atr, atr / mid * 1e4
+    if n >= vwap_bars:
+        rng = range(end - vwap_bars, end)
+        vol = sum(v[j] for j in rng)
+        typ = [(h[j] + lo[j] + c[j]) / 3 for j in rng]
+        vwap = (
+            sum(t * v[j] for t, j in zip(typ, rng, strict=True)) / vol
+            if vol > 0
+            else sum(typ) / len(typ)
+        )
+        sd = (
+            math.sqrt(sum((c[j] - vwap) ** 2 for j in rng) / (vwap_bars - 1))
+            if vwap_bars > 1
+            else 0.0
+        )
+        f["vwap"] = vwap
+        f["vwap_z"] = (mid - vwap) / sd if sd > 0 else None
+    if n > breakout_bars:
+        rng = range(end - 1 - breakout_bars, end - 1)
+        f["hi_n"] = max(h[j] for j in rng)
+        f["lo_n"] = min(lo[j] for j in rng)
+        mean_v = sum(v[j] for j in rng) / breakout_bars
+        f["vol_ratio"] = v[end - 1] / mean_v if mean_v > 0 else None
+    closes = c[start:end]
+    f["ema_fast"] = _ema(closes, 20)
+    f["ema_slow"] = _ema(closes, 60)
+    return f
+
+
+def market_features_at(
+    symbol: str,
+    quote: str,
+    fb: FloatBars,
+    end: int,
+    *,
+    ts: float,
+    bid: Decimal,
+    ask: Decimal,
+    maker_fee: Decimal,
+    taker_fee: Decimal,
+    book_issue: str | None = None,
+    book_imbalance: float | None = None,
+    vwap_bars: int = 60,
+    breakout_bars: int = 30,
+    atr_bars: int = 14,
+    timeframe: int = 1,
+) -> MarketFeatures:
+    """Features from the completed bars fb[:end] (any timeframe) + the current top of book.
+
+    The single implementation used by live ticks and by the walk-forward backtest.
+    """
+    f = _indicators(fb, end, float((bid + ask) / 2), vwap_bars, breakout_bars, atr_bars)
+    return MarketFeatures(
+        symbol=symbol,
+        ts=ts,
+        bid=bid,
+        ask=ask,
+        maker_fee=maker_fee,
+        taker_fee=taker_fee,
+        book_ok=book_issue is None,
+        book_issue=book_issue,
+        quote=quote,
+        imbalance=book_imbalance,
+        timeframe=timeframe,
+        **f,  # type: ignore[arg-type]
+    )
 
 
 def market_features(
@@ -131,56 +236,26 @@ def market_features(
     vwap_bars: int = 60,
     breakout_bars: int = 30,
     atr_bars: int = 14,
+    timeframe: int = 1,
 ) -> MarketFeatures:
-    """Features from completed 1-min bars + the current top of book."""
-    closes = [float(b.c) for b in bars]
-    mid = float((bid + ask) / 2)
-    f: dict[str, float | None] = {}
-    if closes:
-        f["last_close"] = closes[-1]
-        for k, n in (("ret_1m", 1), ("ret_5m", 5), ("ret_15m", 15)):
-            f[k] = (mid / closes[-1 - n] - 1) if len(closes) > n and closes[-1 - n] > 0 else None
-    if len(closes) >= 31:
-        rets = [b / a - 1 for a, b in zip(closes[-31:-1], closes[-30:], strict=True) if a > 0]
-        if len(rets) > 2:
-            m = sum(rets) / len(rets)
-            f["vol_bps"] = math.sqrt(sum((r - m) ** 2 for r in rets) / (len(rets) - 1)) * 1e4
-    atr = _atr(bars, atr_bars)
-    if atr is not None and mid > 0:
-        f["atr"], f["atr_bps"] = atr, atr / mid * 1e4
-    if len(bars) >= vwap_bars:
-        win = bars[-vwap_bars:]
-        vol = sum(float(b.v) for b in win)
-        typ = [(float(b.h) + float(b.l) + float(b.c)) / 3 for b in win]
-        vwap = (
-            sum(t * float(b.v) for t, b in zip(typ, win, strict=True)) / vol
-            if vol > 0
-            else sum(typ) / len(typ)
-        )
-        dev = [float(b.c) - vwap for b in win]
-        sd = math.sqrt(sum(d * d for d in dev) / (len(dev) - 1)) if len(dev) > 1 else 0.0
-        f["vwap"] = vwap
-        f["vwap_z"] = (mid - vwap) / sd if sd > 0 else None
-    if len(bars) > breakout_bars:
-        prev = bars[-breakout_bars - 1 : -1]
-        f["hi_n"] = max(float(b.h) for b in prev)
-        f["lo_n"] = min(float(b.l) for b in prev)
-        mean_v = sum(float(b.v) for b in prev) / len(prev)
-        f["vol_ratio"] = float(bars[-1].v) / mean_v if mean_v > 0 else None
-    f["ema_fast"] = _ema(closes, 20)
-    f["ema_slow"] = _ema(closes, 60)
-    return MarketFeatures(
-        symbol=symbol,
+    """Live convenience wrapper: converts the last WINDOW bars and calls market_features_at."""
+    fb = FloatBars(bars[-WINDOW:])
+    return market_features_at(
+        symbol,
+        quote,
+        fb,
+        len(fb),
         ts=ts,
         bid=bid,
         ask=ask,
         maker_fee=maker_fee,
         taker_fee=taker_fee,
-        book_ok=book_issue is None,
         book_issue=book_issue,
-        quote=quote,
-        imbalance=book_imbalance,
-        **f,  # type: ignore[arg-type]
+        book_imbalance=book_imbalance,
+        vwap_bars=vwap_bars,
+        breakout_bars=breakout_bars,
+        atr_bars=atr_bars,
+        timeframe=timeframe,
     )
 
 

@@ -56,9 +56,9 @@ def spawn(settings: Settings, mode: Mode, markets: list[str]) -> int:
 
 
 def wait_ready(settings: Settings, console: Console, timeout_s: float = 240) -> bool:
-    """Startup includes the 3-day candle replay, so readiness can take a while."""
+    """Startup includes the incremental history sync and regime calibration."""
     deadline = time.time() + timeout_s
-    with console.status("Engine starting (preflight, universe, 3-day replay)…"):
+    with console.status("Engine starting (preflight, universe, history sync)…"):
         while time.time() < deadline:
             if engine_running(settings):
                 return True
@@ -120,12 +120,23 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     if st.get("flat_by_design"):
         console.print("[bold cyan]flat by design: no strategy has proven edge yet[/]")
 
-    s = Table(title="Strategies (promotion needs backtest AND shadow)", header_style="bold cyan")
+    wf = st.get("walk_forward") or {}
+    age = wf.get("age_h")
+    age_txt = (
+        "no run"
+        if age is None
+        else f"run #{wf.get('run_id')}, {age}h old (max {wf.get('max_age_h')}h)"
+    )
+    s = Table(
+        title=f"Strategies (promotion needs walk-forward OOS AND shadow · {age_txt})",
+        header_style="bold cyan",
+    )
     for col in (
         "Strategy",
         "Status",
+        "TF",
         "Weight",
-        "Backtest n / net / PF",
+        "OOS n / net / PF",
         "Shadow n / net / PF",
         "Paper equity",
         "Open",
@@ -133,14 +144,15 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     ):
         s.add_column(col, overflow="fold")
     for x in st["strategies"]:
-        bt, sh = x.get("backtest", {}), x.get("shadow", {})
+        bt, sh = x.get("oos", {}), x.get("shadow", {})
         status = x["status"]
         color = "green" if x["promoted"] else ("magenta" if x["paper_only"] else "white")
         s.add_row(
             x["name"],
             f"[{color}]{status}[/]",
+            f"{x.get('timeframe')}m",
             x["weight"],
-            f"{bt.get('n')} / {bt.get('net_tmn')} / {bt.get('pf')}",
+            f"{bt.get('n')} / {bt.get('net_tmn')} / {bt.get('pf')}" if bt else "– (no selection)",
             f"{sh.get('n')} / {sh.get('net_tmn')} / {sh.get('pf')}",
             x["paper_equity"],
             ", ".join(x["open_paper_positions"] + [f"{p}(maker)" for p in x["pending_maker"]])
@@ -165,10 +177,9 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
         )
     console.print(fd)
     rg = st.get("regime") or {}
-    rp = st.get("replay") or {}
     console.print(
-        f"[dim]regime: {rg} · allocation: {st.get('allocation_source')} · errors: {st.get('errors')}\n"
-        f"replay: {rp.get('days')}d, {rp.get('steps')} steps in {rp.get('seconds')}s · package: {st.get('package')}\n"
+        f"[dim]regime (percentiles vs 30d history): {rg} · allocation: {st.get('allocation_source')} · errors: {st.get('errors')}\n"
+        f"walk-forward: grid {wf.get('grid_size')}, split {wf.get('split')}, report {wf.get('report')} · package: {st.get('package')}\n"
         f"events: {st.get('events')}\npreflight: {st.get('preflight')}[/]"
     )
     if st.get("dust"):

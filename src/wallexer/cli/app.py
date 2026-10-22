@@ -212,6 +212,37 @@ def flatten(
     console.print(resp)
 
 
+history_app = typer.Typer(help="Candle history (30 days, incremental).", no_args_is_help=True)
+app.add_typer(history_app, name="history")
+
+
+@history_app.command("sync")
+@friendly
+def history_sync(
+    days: int = typer.Option(30, "--days", help="How many days back to keep."),
+) -> None:
+    """Fetch missing 1-min / 60-min candles for the universe; rebuild 5/15-min from 1-min."""
+    from wallexer.cli.backtest_cmds import run_history_sync
+
+    asyncio.run(run_history_sync(load_settings(), console, days))
+
+
+@app.command()
+@friendly
+def backtest(
+    walk_forward: bool = typer.Option(
+        False, "--walk-forward", help="Tune on the oldest 2/3 of history, judge on the newest 1/3."
+    ),
+) -> None:
+    """Backtest on stored candles (30 days, incremental sync first)."""
+    from wallexer.cli.backtest_cmds import run_walk_forward
+
+    if not walk_forward:
+        console.print("Only --walk-forward is implemented: `wallexer backtest --walk-forward`.")
+        raise typer.Exit(1)
+    asyncio.run(run_walk_forward(load_settings(), console))
+
+
 def main() -> None:
     setup_logging()
     app()

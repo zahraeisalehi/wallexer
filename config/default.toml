@@ -98,8 +98,6 @@ frozen_book_s = 60.0
 socket_path = "data/engine.sock"
 health_port = 8000
 log_path = "data/logs/engine.log"
-# Days of 1-min candles replayed at startup to seed backtest paper stats.
-replay_days = 3
 
 [paper]
 capital_tmn = "5000000"
@@ -108,21 +106,29 @@ maker_timeout_s = 60.0
 position_frac = "0.2"
 
 [strategies.basis_tmn_usdt]
+# Paper-only (non-atomic legs); evaluated on live shadow books only, never on candles.
 edge_margin_bps = "5"
+timeframe = 1
 
 [strategies.mean_reversion]
+# TMN markets only for now (no USDT conversion cycles).
+quotes = ["TMN"]
+timeframe = 15
 edge_margin_bps = "10"
 vwap_bars = 60
 z_entry = 2.0
-time_stop_min = 120
+exit_frac = 0.25
+min_reward_risk = 1.5
+time_stop_bars = 24
 
 [strategies.momentum]
-edge_margin_bps = "10"
+timeframe = 15
 breakout_bars = 30
 vol_ratio_min = 1.5
 imbalance_min = 0.1
 atr_target_mult = 2.0
-time_stop_min = 240
+cost_mult = 2.0
+time_stop_bars = 16
 
 [promotion]
 # Live weight only if BOTH: the backtest replay passes (>= trades, net > 0, PF > min) AND
@@ -140,6 +146,25 @@ score_window_trades = 30
 usdt_rebalance_band_pct = "5"
 usdt_min_hold_min = 60
 usdt_breakeven_trades_per_cycle = "2"
+
+[backtest]
+history_days = 30
+split_frac = 0.6666666667
+timeframes = [1, 5, 15, 60]
+min_is_trades = 10
+# The engine refuses to PROMOTE from a walk-forward run older than max_run_age_h and warns at
+# warn_run_age_h. An already-promoted strategy is never demoted just because the run aged.
+max_run_age_h = 36
+warn_run_age_h = 20
+
+[backtest.grid_mean_reversion]
+z_entry = [1.5, 2.0, 2.5]
+exit_frac = [0.0, 0.25, 0.5]
+
+[backtest.grid_momentum]
+breakout_bars = [20, 40]
+atr_target_mult = [2.0, 3.0]
+vol_ratio_min = [1.5, 2.0]
 
 [store]
 db_path = "data/wallexer.db"

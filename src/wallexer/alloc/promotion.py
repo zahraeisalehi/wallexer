@@ -1,7 +1,7 @@
 """Promotion gate: a strategy gets live weight only after it has shown edge on paper.
 
 Promoted iff BOTH:
-- backtest (startup replay of recent candles): >= min_backtest_trades closed trades,
+- walk-forward: the IS-selected config's OUT-OF-SAMPLE stats have >= min_backtest_trades trades,
   net PnL > 0 and profit factor > min_profit_factor; AND
 - shadow (paper on live data): >= min_shadow_trades closed trades and net PnL >= 0.
 Demoted when the last `demote_window_trades` shadow trades are net-negative.
@@ -65,42 +65,89 @@ class PromotionStatus:
     strategy: str
     promoted: bool
     paper_only: bool
-    backtest: TradeStats
+    oos: TradeStats | None  # selected config's out-of-sample stats from the walk-forward run
     shadow: TradeStats
     reason: str
 
 
-def evaluate(
-    strategy: str,
-    backtest: Sequence[PaperTrade],
-    shadow: Sequence[PaperTrade],
-    cfg: PromotionCfg,
-    currently_promoted: bool,
-) -> PromotionStatus:
-    bt, sh = stats(backtest), stats(shadow)
-    if strategy in cfg.paper_only:
-        return PromotionStatus(strategy, False, True, bt, sh, "paper-only: non-atomic legs")
-    pf = bt.profit_factor
-    bt_ok = (
-        bt.n >= cfg.min_backtest_trades
-        and bt.net > 0
+def oos_ok(s: TradeStats | None, cfg: PromotionCfg) -> bool:
+    if s is None:
+        return False
+    pf = s.profit_factor
+    return (
+        s.n >= cfg.min_backtest_trades
+        and s.net > 0
         and pf is not None
         and pf > cfg.min_profit_factor
     )
-    sh_ok = sh.n >= cfg.min_shadow_trades and sh.net >= 0
+
+
+def evaluate(
+    strategy: str,
+    oos: TradeStats | None,
+    oos_reason: str,
+    shadow: Sequence[PaperTrade],
+    cfg: PromotionCfg,
+    currently_promoted: bool,
+    *,
+    run_age_h: float | None,
+    max_run_age_h: float,
+) -> PromotionStatus:
+    """Promotion needs the walk-forward OOS gate AND non-negative shadow paper trades.
+
+    The run's age only blocks NEW promotions (older than max_run_age_h); an already-promoted
+    strategy is never demoted just because the run aged. It is demoted when its rolling shadow
+    PnL turns negative, or when a newer run's OOS stats fail the gate.
+    """
+    sh = stats(shadow)
+    if strategy in cfg.paper_only:
+        return PromotionStatus(
+            strategy, False, True, oos, sh, "paper-only: non-atomic legs · shadow-evaluated"
+        )
     recent = [t for t in shadow if t.kind != "conversion"][-cfg.demote_window_trades :]
     rolling_negative = bool(recent) and stats(recent).net < 0
-    if currently_promoted and rolling_negative:
+    sh_ok = sh.n >= cfg.min_shadow_trades and sh.net >= 0
+    if currently_promoted:
+        if rolling_negative:
+            return PromotionStatus(
+                strategy, False, False, oos, sh, "demoted: rolling shadow net PnL < 0"
+            )
+        if not oos_ok(oos, cfg):
+            return PromotionStatus(
+                strategy, False, False, oos, sh, f"demoted: walk-forward OOS fails ({oos_reason})"
+            )
         return PromotionStatus(
-            strategy, False, False, bt, sh, "demoted: rolling shadow net PnL < 0"
+            strategy, True, False, oos, sh, "promoted (OOS + shadow); kept regardless of run age"
         )
-    if not bt_ok:
-        why = (
-            f"backtest {bt.n}/{cfg.min_backtest_trades} trades, net {bt.net:.0f}, "
-            f"PF {bt.as_dict()['pf']} (need > {cfg.min_profit_factor})"
+    if run_age_h is None:
+        return PromotionStatus(
+            strategy,
+            False,
+            False,
+            oos,
+            sh,
+            "no walk-forward run: `wallexer backtest --walk-forward`",
         )
-        return PromotionStatus(strategy, False, False, bt, sh, why)
+    if not oos_ok(oos, cfg):
+        return PromotionStatus(strategy, False, False, oos, sh, f"OOS: {oos_reason}")
+    if run_age_h > max_run_age_h:
+        return PromotionStatus(
+            strategy,
+            False,
+            False,
+            oos,
+            sh,
+            f"walk-forward run {run_age_h:.0f}h old > {max_run_age_h:.0f}h: rerun",
+        )
     if not sh_ok:
-        why = f"shadow {sh.n}/{cfg.min_shadow_trades} trades, net {sh.net:.0f} (need >= 0)"
-        return PromotionStatus(strategy, False, False, bt, sh, why)
-    return PromotionStatus(strategy, True, False, bt, sh, "backtest and shadow gates passed")
+        return PromotionStatus(
+            strategy,
+            False,
+            False,
+            oos,
+            sh,
+            f"OOS passes; shadow {sh.n}/{cfg.min_shadow_trades} trades, net {sh.net:.0f} (need >= 0)",
+        )
+    return PromotionStatus(
+        strategy, True, False, oos, sh, "walk-forward OOS and shadow gates passed"
+    )

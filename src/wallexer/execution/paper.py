@@ -16,7 +16,7 @@ equity is never overstated. Positions are likewise marked at bid net of the exit
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -282,7 +282,7 @@ class PaperBook:
         stop = sig.stop if sig.stop is not None else px * Decimal("0.98")
         entry_fx = (self._usdt_mid(f) or Decimal(1)) if m.quote == "USDT" else Decimal(1)
         self.lots[sig.market] = _Lot(
-            Position(sig.market, qty, px, now, stop, m.bid),
+            Position(sig.market, qty, px, now, stop, m.bid, sig.entry_dev or 0.0),
             m.quote,
             fee_tmn,
             entry_fx,
@@ -413,7 +413,7 @@ class PaperBook:
             m = f.markets.get(sym)
             if m is not None and m.bid > lot.pos.peak:
                 pos = lot.pos
-                lot.pos = Position(pos.symbol, pos.qty, pos.entry_px, pos.entry_ts, pos.stop, m.bid)
+                lot.pos = replace(pos, peak=m.bid)
         # 3. signals
         for sig in signals:
             m = f.markets.get(sig.market)
@@ -436,6 +436,20 @@ class PaperBook:
             done.append(t)
         eq = self.equity(f)
         self.peak_equity = max(self.peak_equity, eq)
+        return done
+
+    def close_all(self, f: Features, now: float, reason: str) -> list[PaperTrade]:
+        """Close every position at taker prices (walk-forward segment end), cancel resting orders."""
+        self.pending.clear()
+        done = []
+        for sym in list(self.lots):
+            m = f.markets.get(sym)
+            if m is not None:
+                done.append(self._close(sym, m, f, now, {"exit": reason}))
+        self.usdt_last_used_ts = None
+        t = self._maybe_close_usdt_cycle(f, now)
+        if t:
+            done.append(t)
         return done
 
     def drawdown_pct(self, f: Features) -> Decimal:

@@ -21,7 +21,7 @@ Full schemas: `docs/ref/wallex-spot-trading.json` (orders, depth/all) and `docs/
 | GET | `/depth/all` | order book for **all markets in one call**: `result[SYMBOL] = {ask:[{price,quantity,sum}], bid:[...]}`. Use this for polling (1 call instead of N). **Observed 2026-10-22: nginx HTML 503, persistently (without key)** → client falls back to `/v1/depth` per market |
 | GET | `/v1/depth?symbol=` | order book for one market |
 | GET | `/v1/trades?symbol=` | latest trades: `result.latestTrades[] = {quantity, price, sum, isBuyOrder, timestamp}` |
-| GET | `/v1/udf/history?symbol=&resolution=&from=&to=` | candles, TradingView UDF format: `{s:"ok", t:[], o:[], h:[], l:[], c:[], v:[]}` (**no** success/result envelope); resolution `1,5,15,60,D`; from/to unix seconds. Use for backtests. **1-min bars: request ≤ 1 day per call** (a 3-day request returns `s: "no_data"`; 1-day chunks return 1440 bars). Gaps (missing minutes) occur |
+| GET | `/v1/udf/history?symbol=&resolution=&from=&to=` | candles, TradingView UDF format: `{s:"ok", t:[], o:[], h:[], l:[], c:[], v:[]}` (**no** success/result envelope); from/to unix seconds. **Verified resolutions: only `1`, `60`, `D`.** `5` and `30` return `s: "error"` ("Invalid resolution!"); `15` silently returns 1-min bars; `240` returns 60-min bars. 5/15-min are resampled locally from 1-min. **1-min: ≤ 1 day per request** (longer → `no_data`); day chunks reach back ≥ 40 days. **60-min:** a 31-day request returned 29 days → 7-day chunks. Gaps occur (0.2–2.6% of minutes over 30 days) |
 
 ## Account
 | Method | Path | Notes |

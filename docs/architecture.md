@@ -48,14 +48,14 @@ Initial strategy set (each is small; quality over count):
 
 ### Promotion gate (default stance: flat)
 A strategy gets live weight only when **both** hold:
-- **backtest:** at engine startup the last 3 days of 1-min candles are replayed through the same strategies and paper fill model (taker fills at close ± half the current spread + slippage, real fees; book imbalance replaced by the candle proxy (c−o)/(h−l)). Needs ≥ 10 closed trades, net PnL > 0, profit factor > 1.2. Trades are stored with `source=backtest`.
+- **walk-forward (out-of-sample only):** `wallexer backtest --walk-forward` replays ~30 days of stored candles (1/5/15/60-min; 5/15 resampled from 1-min) through the same strategies, feature code, paper fill model and real fees. Tuning (a small, logged grid: 68 configs) uses the oldest 2/3; the IS-best config (≥ 10 IS trades, IS PF > 1) is then judged on the newest 1/3. Gate: OOS ≥ 10 trades, net PnL > 0, PF > 1.2. Results in `backtest_runs`/`backtest_results` and `data/reports/walkforward-*.md`.
 - **shadow:** paper trades on live data (`source=shadow`) are not net-negative, with ≥ 3 trades.
-Demotion when the last 10 shadow trades are net-negative. Promotions/demotions are decision rows. Until something is promoted the account stays flat (`status`: "flat by design").
+A run older than `backtest.max_run_age_h` (36 h) cannot promote (warning at 20 h); an already-promoted strategy is never demoted just because the run aged, only by rolling shadow losses or a newer failing run. `basis_tmn_usdt` is shadow-evaluated only (needs simultaneous books) and paper-only. Promotions/demotions are decision rows. Until something is promoted the account stays flat (`status`: "flat by design").
 
 ### Allocator (quant baseline)
 - Per strategy, rolling net-of-fee score: EWMA of returns / EWMA of volatility (a rolling Sharpe), plus drawdown penalty.
 - Baseline weights = softmax(score / τ), with floor 0, cap `max_strategy_weight`, and weight 0 if the strategy is in its own drawdown stop.
-- Regime model (Phase 2: simple vol/trend classifier; HMM later if time allows) multiplies weights by regime fit.
+- Regime model: vol/trend classifier on 15-min bars, expressed as percentile ranks against the stored 30-day history (no fixed scaling), multiplies weights by regime fit.
 - Account targets per market = Σ over promoted strategies of weight × that strategy's paper position fraction; the account trades the difference (decision row → risk gate → executor).
 
 ### USDT inventory (allocator decision, not a per-trade cost)

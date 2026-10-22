@@ -238,13 +238,12 @@ def insert_depth_snapshot(
 def upsert_candles(conn: sqlite3.Connection, symbol: str, resolution: str, bars: list[Any]) -> None:
     # One transaction for the batch (autocommit would commit, and sync, per row).
     with conn:
-        _upsert_candles(conn, symbol, resolution, bars)
+        conn.execute("BEGIN")
+        insert_candles(conn, symbol, resolution, bars)
 
 
-def _upsert_candles(
-    conn: sqlite3.Connection, symbol: str, resolution: str, bars: list[Any]
-) -> None:
-    conn.execute("BEGIN")
+def insert_candles(conn: sqlite3.Connection, symbol: str, resolution: str, bars: list[Any]) -> None:
+    """Rows only; the caller owns the transaction."""
     conn.executemany(
         "INSERT OR REPLACE INTO candles (symbol, resolution, ts, open, high, low, close, volume)"
         " VALUES (?,?,?,?,?,?,?,?)",
