@@ -9,7 +9,7 @@ Full schemas: `docs/ref/wallex-spot-trading.json` (orders, depth/all) and `docs/
 - Status codes seen: 200/201 ok, 400 bad params, 401 auth, 404 not found, 422 validation.
 - Numbers often arrive as **strings** with 16 decimals → parse to `Decimal`. Depth `price`/`quantity` arrive as JSON **floats** → parse JSON with `parse_float=Decimal`. Some markets send `""` for numeric fields (e.g. `price`) → treat as null.
 - Symbol format: `BTCTMN`, `ETHUSDT`, `USDTTMN` (no slash). `data/not_allowed.txt` uses `BTC/TMN` → strip the slash to compare.
-- Rate limit (market data): responses carry `x-ratelimit-limit` (seen: 600) and `x-ratelimit-remaining` (seen on `/v1/trades`, not on cached `/markets`). Read these headers, keep a client-side limiter, back off at < 10% remaining. Window length not documented: measure it in `doctor`.
+- Rate limit (market data): **600 requests per 39 s window** (user-confirmed). Responses carry `x-ratelimit-limit` and `x-ratelimit-remaining` (seen on `/v1/trades`, not on cached `/markets`). Consecutive responses can report very different `remaining` (e.g. 556 → 386 → 460), apparently from different backend nodes, so treat the header as a hint. The feed plans its own budget (≤ 70% of the limit per window) and the client backs off at < 10% remaining.
 - Order rate limit: see "Order rate limit" below (separate limiter).
 - Minimum order value: see "Minimum order value" below.
 - `/hector/web/v1/markets` is served from a cache (`cache-control: max-age=30`, `x-cache-status: HIT`): prices there can be 30 s old and its `Date` header is stale (don't use it for clock skew).
@@ -21,7 +21,7 @@ Full schemas: `docs/ref/wallex-spot-trading.json` (orders, depth/all) and `docs/
 | GET | `/depth/all` | order book for **all markets in one call**: `result[SYMBOL] = {ask:[{price,quantity,sum}], bid:[...]}`. Use this for polling (1 call instead of N). **Observed 2026-10-22: nginx HTML 503, persistently (without key)** → client falls back to `/v1/depth` per market |
 | GET | `/v1/depth?symbol=` | order book for one market |
 | GET | `/v1/trades?symbol=` | latest trades: `result.latestTrades[] = {quantity, price, sum, isBuyOrder, timestamp}` |
-| GET | `/v1/udf/history?symbol=&resolution=&from=&to=` | candles, TradingView UDF format: `{s:"ok", t:[], o:[], h:[], l:[], c:[], v:[]}` (**no** success/result envelope); resolution `1,5,15,60,D`; from/to unix seconds. Use for backtests |
+| GET | `/v1/udf/history?symbol=&resolution=&from=&to=` | candles, TradingView UDF format: `{s:"ok", t:[], o:[], h:[], l:[], c:[], v:[]}` (**no** success/result envelope); resolution `1,5,15,60,D`; from/to unix seconds. Use for backtests. **1-min bars: request ≤ 1 day per call** (a 3-day request returns `s: "no_data"`; 1-day chunks return 1440 bars). Gaps (missing minutes) occur |
 
 ## Account
 | Method | Path | Notes |
@@ -68,16 +68,28 @@ Rules for our client:
 ## WebSocket (not used in v1)
 Centrifugo-based at `wss://api.wallex.ir/connection/websocket` (exact path, no trailing slash). Channel names are undocumented here → we poll REST (`/depth/all` + `/v1/trades`) instead. Revisit only if polling hits rate limits.
 
+## Trading-credit package (read-only, user-confirmed)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/v1/prop/packages` | `result: [ {id, title, currency, loan, assurance, warning_limit, liquidity_limit, status, expire_days, daily_fee, final_fee, ...} ]` (22 packages). Ours: the one with `loan == "5000000"` and `currency == "TMN"` → id 183 "هکاتون استارکوچ \| والکس" |
+| GET | `/v1/prop/packages/{id}` | `result: {detail: {...same fields}, unavailableMarkets: [symbols], faq: []}`. 357 unavailable symbols = all of not_allowed.txt + BAL, CATS, DAI, IP, OM, RDNT (TMN + USDT) |
+
+- `unavailableMarkets` is saved to `data/unavailable_markets.txt`, excluded from the universe, and rejected again by the risk gate.
+- `warning_limit "1000"` / `liquidity_limit "900"` are plain TMN amounts (the UI shows "900 تومان"): liquidation is effectively unreachable; our 8% hard stop is what limits losses.
+- Only these two GETs. No package purchase, transfer or any other `/v1/prop/*` call.
+
 ## Out of scope: do not use
 - OTC / easy-trade (`/v1/otc/*`, `/v1/account/easy-trade/orders`): not spot order-book trading; excluded unless organizers confirm it's allowed.
-- Sub-account management, transfers, prop/trade-credit packages, withdrawals, IBAN, cards, wallet addresses.
+- Sub-account management, transfers, any prop/package endpoint other than the two read-only GETs above, withdrawals, IBAN, cards, wallet addresses.
 
 ## Trading-credit account (confirmed)
 We trade **only** with the trading-credit (sub) account (spot only; no margin/futures).
 - `WALLEX_API_KEY` must be **the trading-credit account's own API key**, not the main account's.
 - `WALLEX_SUBACCOUNT_ID` is **required**. Header `sub-account-client-id: <WALLEX_SUBACCOUNT_ID>` is sent on **every** private request.
-- `doctor` and the engine startup check that balances show about **5,000,000 TMN** of trading credit: equity (TMN + coins marked at best bid) within `account.equity_tolerance_pct` (±10%) of `account.expected_equity_tmn`. Equity rather than TMN alone, so a restart while holding positions can still start and sell back to TMN.
-- If the key or id is missing, or the balance check fails, **shadow and trade refuse to start** with a clear error (`preflight_live`).
+- Key + sub-account id are always mandatory; without them shadow and trade refuse to start.
+- **First start** (no trade-mode decisions/orders in the DB): the **TMN balance** must be ≈ 5,000,000 (±10%), otherwise shadow/trade refuse to start (`preflight_live`).
+- **Later starts:** equity and drawdown vs 5M are only reported (warning), so a restart while holding positions can always start and sell back to TMN.
+- Equity = Σ (value + locked), coins marked at best bid. Assumption: `value` excludes `locked` (verify on the first live open order; double counting would hide drawdown).
 - Never call `/sub-accounts/transfers` or any transfer endpoint.
 
 ## Wallex MCP

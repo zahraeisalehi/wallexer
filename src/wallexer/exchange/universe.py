@@ -84,6 +84,18 @@ class Universe:
     depth_source: str  # "depth/all" | "v1/depth fallback (<reason>)"
     usdt_tmn: Decimal | None
     excluded: dict[str, int] = field(default_factory=dict)
+    unavailable: frozenset[str] = frozenset()  # trading-credit package restrictions
+
+    @property
+    def symbols(self) -> list[str]:
+        return [e.market.symbol for e in self.entries]
+
+    @property
+    def limit_only(self) -> frozenset[str]:
+        """Universe markets without MARKET orders (opt-in; risk gate halves their max position)."""
+        return frozenset(
+            e.market.symbol for e in self.entries if not e.market.market_orders_enabled
+        )
 
     @property
     def rules(self) -> dict[str, MarketRules]:
@@ -162,20 +174,31 @@ async def build_universe(
     settings: Settings,
     *,
     fees: FeeTable | None = None,
+    unavailable: frozenset[str] = frozenset(),
+    only: list[str] | None = None,
 ) -> Universe:
+    """`unavailable`: the package's unavailableMarkets. `only`: restrict to these symbols."""
     ucfg = settings.cfg.universe
     forbidden = load_not_allowed(settings.cfg.path(ucfg.not_allowed_path))
     markets = await client.markets()
 
-    excluded = {"not_spot": 0, "not_allowed": 0, "quote": 0}
+    excluded = {"not_spot": 0, "not_allowed": 0, "unavailable": 0, "quote": 0, "limit_only": 0}
     kept: list[Market] = []
     for m in markets:
         if not m.is_spot:
             excluded["not_spot"] += 1
         elif not market_allowed(m, forbidden):
             excluded["not_allowed"] += 1
+        elif not market_allowed(m, unavailable):
+            excluded["unavailable"] += 1
         elif m.quote_asset not in ucfg.quote_assets:
             excluded["quote"] += 1
+        elif not m.market_orders_enabled and not ucfg.include_limit_only and m.symbol != USDT_TMN:
+            # Default universe: MARKET-enabled markets only (exits can always be immediate).
+            excluded["limit_only"] += 1
+        elif only and m.symbol not in only:
+            excluded.setdefault("not_selected", 0)
+            excluded["not_selected"] += 1
         else:
             kept.append(m)
 
@@ -222,4 +245,5 @@ async def build_universe(
         else:
             entries.append(e)
     entries.sort(key=lambda e: e.score, reverse=True)
-    return Universe(entries[: ucfg.top_n], candidates, source, usdt, excluded)
+    n = min(ucfg.top_n, ucfg.max_markets)
+    return Universe(entries[:n], candidates, source, usdt, excluded, unavailable)

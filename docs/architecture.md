@@ -22,7 +22,8 @@
 
 - **Engine and CLI are separate processes.** The engine survives disconnects; the CLI sends commands over the unix socket and reads SQLite for display.
 - **Trading uses Wallex REST directly.** The Wallex MCP is used only by the LLM agent as read-only tools (market data), never for orders.
-- **Market data by polling.** `GET /depth/all` (every market's book in one call) every 2–5 s + `/v1/trades` for the active universe + `/v1/udf/history` for candles. No WebSocket in v1.
+- **Market data by polling.** `GET /depth/all` (every market's book in one call) when it works, else `/v1/depth` per market, every 3 s + `/v1/trades` every 10 s + `/v1/udf/history` 1-min candles. No WebSocket in v1.
+- **Universe default:** the markets with MARKET orders enabled (7 on 2026-10-22: BTC/ETH/XAUT on TMN and USDT + USDTTMN), minus not_allowed and the package's unavailableMarkets. LIMIT-only markets are opt-in (`universe.include_limit_only`) with half the max position.
 - **One code path, three executors.** Strategies, allocator and risk gate are identical in backtest, shadow and live. Only the Executor differs.
 
 ## 2. Strategy selection is dynamic, not a single strategy
@@ -37,16 +38,25 @@ class Strategy(Protocol):
 Initial strategy set (each is small; quality over count):
 | name | idea | active best in |
 |---|---|---|
-| `basis_tmn_usdt` | X/TMN vs X/USDT × USDT/TMN mispricing; trade the leg that is off | any regime, needs liquid triangle |
+| `basis_tmn_usdt` | X/TMN vs X/USDT × USDT/TMN mispricing, traded as a TMN→…→TMN triangle cycle (no inventory); threshold = Σ 3 taker fees + Σ 3 spreads + margin. **Paper-only** until leg-failure unwinding exists (non-atomic legs) | any regime, needs liquid triangle |
 | `mean_reversion` | z-score of price vs rolling VWAP / Bollinger, fade extremes | ranging, low vol |
 | `momentum` | breakout of N-bar range with volume confirmation | trending |
 
 **Every strategy always runs on its own paper book** (simulated fills, fees included), in every mode. That gives a live, comparable scoreboard.
 
+**Long-only** (spot). Every entry threshold = the market's real round trip (fees from `/v1/account/fee` + current spread) + a margin; never a global constant. Non-urgent entries are maker (LIMIT at best bid). Books with crossed/locked or stale data produce no signals.
+
+### Promotion gate (default stance: flat)
+A strategy gets live weight only when **both** hold:
+- **backtest:** at engine startup the last 3 days of 1-min candles are replayed through the same strategies and paper fill model (taker fills at close ± half the current spread + slippage, real fees; book imbalance replaced by the candle proxy (c−o)/(h−l)). Needs ≥ 10 closed trades, net PnL > 0, profit factor > 1.2. Trades are stored with `source=backtest`.
+- **shadow:** paper trades on live data (`source=shadow`) are not net-negative, with ≥ 3 trades.
+Demotion when the last 10 shadow trades are net-negative. Promotions/demotions are decision rows. Until something is promoted the account stays flat (`status`: "flat by design").
+
 ### Allocator (quant baseline)
 - Per strategy, rolling net-of-fee score: EWMA of returns / EWMA of volatility (a rolling Sharpe), plus drawdown penalty.
 - Baseline weights = softmax(score / τ), with floor 0, cap `max_strategy_weight`, and weight 0 if the strategy is in its own drawdown stop.
-- Regime model (HMM or vol/trend classifier) multiplies weights by regime fit.
+- Regime model (Phase 2: simple vol/trend classifier; HMM later if time allows) multiplies weights by regime fit.
+- Account targets per market = Σ over promoted strategies of weight × that strategy's paper position fraction; the account trades the difference (decision row → risk gate → executor).
 
 ### USDT inventory (allocator decision, not a per-trade cost)
 USDT-quoted markets are the cheap fee tier (0.10/0.13% vs 0.25/0.30% on TMN), but trading them requires holding USDT, bought with TMN on USDTTMN and sold back before the end. That conversion is a **separate decision** made by the allocator, not by each trade.
@@ -115,5 +125,5 @@ The risk gate can only reduce or reject orders, never enlarge them. It runs afte
 `config guardrail`, `autoset guardrail`, `markets`, `flatten [market]`, `doctor`, `export`.
 
 ## 7. Storage (SQLite, WAL)
-`candles`, `depth_snapshots`, `orders`, `fills`, `decisions`, `strategy_paper_pnl`, `allocations`, `llm_calls`, `equity_curve`, `events`.
+`candles`, `depth_snapshots`, `orders`, `fills`, `decisions`, `strategy_paper_pnl`, `paper_trades` (closed paper trades per strategy with `source` backtest|shadow and `kind` trade|cycle|conversion; feeds the promotion gate), `allocations`, `llm_calls`, `equity_curve`, `events` (incl. `flatten.dust_accepted`, `feed.book_crossed`/`feed.book_stale`, `risk.*`).
 `export` zips: decisions, orders, fills, equity curve, allocations, llm_calls, config, backtest/shadow reports.
