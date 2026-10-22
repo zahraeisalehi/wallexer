@@ -191,6 +191,8 @@ class BacktestCfg(BaseModel):
     # Engine: runs older than this cannot promote a strategy; warn earlier so it is rerun.
     max_run_age_h: float = 36
     warn_run_age_h: float = 20
+    # Engine re-runs the walk-forward in a low-priority subprocess this often (0 = never).
+    rerun_every_h: float = 12
     grid_mean_reversion: dict[str, list[float]] = {
         "z_entry": [1.5, 2.0, 2.5],
         "exit_frac": [0.0, 0.25, 0.5],

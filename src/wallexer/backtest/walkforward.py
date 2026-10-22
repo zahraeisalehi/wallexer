@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import itertools
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -195,7 +195,8 @@ def select(results: Sequence[ConfigResult], strategy: str, min_trades: int) -> C
 
 def run(
     settings: Settings,
-    bars_by_tf: Mapping[int, Mapping[str, Sequence[Bar]]],
+    load_bars: Callable[[int], Mapping[str, Sequence[Bar]]],
+    span: tuple[int, int],
     quotes: Mapping[str, str],
     rules: dict[str, MarketRules],
     fees: FeeTable,
@@ -203,11 +204,11 @@ def run(
     spreads_meta: dict[str, Any],
     progress: Any = None,
 ) -> WalkForward:
+    """Memory-bounded: one timeframe's bars and one feature variant are alive at a time
+    (the server has 1 GB). `span` = (common first, common last) 1-min bar timestamps."""
     t0 = time.time()
     b = settings.cfg.backtest
-    one = bars_by_tf[min(bars_by_tf)]
-    h_from = max(bs[0].t for bs in one.values() if bs)
-    h_to = min(bs[-1].t for bs in one.values() if bs)
+    h_from, h_to = span
     split = int(h_from + (h_to - h_from) * b.split_frac)
     configs = grid_configs(settings)
     wf = WalkForward(
@@ -226,13 +227,14 @@ def run(
     )
     sc = settings.cfg.strategies
     for tf in b.timeframes:
+        bars = load_bars(tf)
+        tf_configs = [c for c in configs if c[1] == tf]
         variants = sorted(
-            {int(p["breakout_bars"]) for n, t, p in configs if t == tf and "breakout_bars" in p}
-            | {sc.momentum.breakout_bars}
-        )
-        feats_by_variant = {
-            bb: build_features(
-                bars_by_tf[tf],
+            {int(p["breakout_bars"]) for _n, _t, p in tf_configs if "breakout_bars" in p}
+        ) or [sc.momentum.breakout_bars]
+        for i, bb in enumerate(variants):
+            feats = build_features(
+                bars,
                 quotes,
                 fees,
                 spreads_bps,
@@ -241,30 +243,39 @@ def run(
                 breakout_bars=bb,
                 atr_bars=sc.momentum.atr_bars,
             )
-            for bb in variants
-        }
-        for name, ctf, params in configs:
-            if ctf != tf:
-                continue
-            base = getattr(sc, name)
-            upd: dict[str, Any] = {"timeframe": tf, **params}
-            if "breakout_bars" in upd:
-                upd["breakout_bars"] = int(upd["breakout_bars"])
-            cfg = base.model_copy(update=upd)
-            # mean_reversion ignores hi_n/vol_ratio, so any variant serves it
-            feats = feats_by_variant.get(cfg.breakout_bars) or feats_by_variant[variants[0]]
             is_f = [f for f in feats if f.ts <= split]
             oos_f = [f for f in feats if f.ts > split]
-            res = ConfigResult(
-                name,
-                tf,
-                params,
-                _segment(_make(name, cfg, settings), is_f, _book(settings, rules, "backtest_is")),
-                _segment(_make(name, cfg, settings), oos_f, _book(settings, rules, "backtest_oos")),
-            )
-            wf.results.append(res)
-            if progress:
-                progress(len(wf.results), len(configs))
+            for name, _tf, params in tf_configs:
+                is_momentum = "breakout_bars" in params
+                # momentum configs run on their own variant; mean_reversion ignores hi_n/vol_ratio,
+                # so it runs once, on the first variant
+                if (is_momentum and int(params["breakout_bars"]) != bb) or (
+                    not is_momentum and i != 0
+                ):
+                    continue
+                upd: dict[str, Any] = {"timeframe": tf, **params}
+                if is_momentum:
+                    upd["breakout_bars"] = int(upd["breakout_bars"])
+                cfg = getattr(sc, name).model_copy(update=upd)
+                wf.results.append(
+                    ConfigResult(
+                        name,
+                        tf,
+                        params,
+                        _segment(
+                            _make(name, cfg, settings), is_f, _book(settings, rules, "backtest_is")
+                        ),
+                        _segment(
+                            _make(name, cfg, settings),
+                            oos_f,
+                            _book(settings, rules, "backtest_oos"),
+                        ),
+                    )
+                )
+                if progress:
+                    progress(len(wf.results), len(configs))
+            del feats, is_f, oos_f
+        del bars
     for name in STRATEGIES:
         wf.selected[name] = select(wf.results, name, b.min_is_trades)
     wf.seconds = round(time.time() - t0, 1)

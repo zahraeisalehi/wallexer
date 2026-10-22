@@ -88,6 +88,12 @@ Every cycle writes a `decisions` row (`agent_decision`: trigger, prompt hash, de
 effects) and every allocation cycle an `allocations` row (baseline, agent, final, source, llm_call_id).
 `status` shows stance, rationale and the baseline → agent → final weight diff.
 
+### Order latch call sites
+`client.enable_orders()` is called in exactly two places: `LiveExecutor` (trade mode only) and the
+live smoke test (`wallexer doctor --live-smoke`, typed confirmation, one unfillable order then cancel).
+A hard drawdown stop persists across restarts until `wallexer resume`. The engine re-runs the
+walk-forward every `backtest.rerun_every_h` (12 h) in a `nice` subprocess.
+
 ### Reproducibility of LLM calls
 - Every request/response is stored in table `llm_calls` with a hash of the prompt.
 - `--replay` mode (`wallexer engine run --replay`, `llm.replay = true`) reads recorded responses by prompt hash instead of calling the API; a miss is a logged fallback. `wallexer agent replay <llm_call_id>` re-runs a recorded prompt offline and checks the decision is identical.

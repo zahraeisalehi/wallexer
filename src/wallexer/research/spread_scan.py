@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 import structlog
 
@@ -90,34 +91,12 @@ async def collect(
                 log.warning("scan.fetch_failed", symbol=sym, error=str(e)[:80])
                 await asyncio.sleep(gap * 2)
                 continue
-            bb = max(book.bid, key=lambda lv: lv.price, default=None)
-            ba = min(book.ask, key=lambda lv: lv.price, default=None)
-            with conn:
-                conn.execute("BEGIN")
-                conn.execute(
-                    "INSERT INTO scan_books (ts, symbol, bid, ask, bid_qty, ask_qty) VALUES (?,?,?,?,?,?)",
-                    (
-                        time.time(),
-                        sym,
-                        bb and str(bb.price),
-                        ba and str(ba.price),
-                        bb and str(bb.quantity),
-                        ba and str(ba.quantity),
-                    ),
-                )
-                conn.executemany(
-                    "INSERT OR IGNORE INTO scan_trades (symbol, ts, price, qty, is_buy) VALUES (?,?,?,?,?)",
-                    [
-                        (
-                            sym,
-                            _iso_ts(t.timestamp),
-                            str(t.price),
-                            str(t.quantity),
-                            int(t.is_buy_order),
-                        )
-                        for t in trades
-                    ],
-                )
+            try:
+                _store(conn, sym, book, trades)
+            except sqlite3.OperationalError as e:  # e.g. "database is locked": skip, don't die
+                log.warning("scan.store_failed", symbol=sym, error=str(e))
+                await asyncio.sleep(5)
+                continue
             lim = client.market_limiter
             if (
                 lim.limit
@@ -132,6 +111,31 @@ async def collect(
             symbols=len(symbols),
             seconds=round(time.time() - t_pass, 1),
             at=now_iso(),
+        )
+
+
+def _store(conn: sqlite3.Connection, sym: str, book: Any, trades: Sequence[Any]) -> None:
+    bb = max(book.bid, key=lambda lv: lv.price, default=None)
+    ba = min(book.ask, key=lambda lv: lv.price, default=None)
+    with conn:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO scan_books (ts, symbol, bid, ask, bid_qty, ask_qty) VALUES (?,?,?,?,?,?)",
+            (
+                time.time(),
+                sym,
+                bb and str(bb.price),
+                ba and str(ba.price),
+                bb and str(bb.quantity),
+                ba and str(ba.quantity),
+            ),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO scan_trades (symbol, ts, price, qty, is_buy) VALUES (?,?,?,?,?)",
+            [
+                (sym, _iso_ts(t.timestamp), str(t.price), str(t.quantity), int(t.is_buy_order))
+                for t in trades
+            ],
         )
 
 

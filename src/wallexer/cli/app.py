@@ -6,6 +6,7 @@ import asyncio
 import functools
 import os
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 import typer
@@ -73,9 +74,22 @@ def doctor(
         False, "--quick", help="Skip the rate-limit window measurement (~2 min)."
     ),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip the BoxAPI checks."),
+    live_smoke: bool = typer.Option(
+        False, "--live-smoke", help="Zero-cost LIVE order test (one unfillable order, then cancel)."
+    ),
+    discount_pct: float = typer.Option(
+        20.0, "--discount-pct", help="Live smoke: limit price this % below the best bid."
+    ),
 ) -> None:
     """Connectivity, keys, trading credit, fees, clock skew, rate limits, BoxAPI."""
     from wallexer.cli.doctor import run
+
+    if live_smoke:
+        from wallexer.cli.smoke import run_smoke
+
+        if not asyncio.run(run_smoke(load_settings(), console, Decimal(str(discount_pct)))):
+            raise typer.Exit(1)
+        return
 
     ok = asyncio.run(run(load_settings(), console, quick=quick, check_llm=not no_llm))
     if not ok:
@@ -238,6 +252,11 @@ def backtest(
     walk_forward: bool = typer.Option(
         False, "--walk-forward", help="Tune on the oldest 2/3 of history, judge on the newest 1/3."
     ),
+    if_older_than: float = typer.Option(
+        0,
+        "--if-older-than",
+        help="Skip if the latest walk-forward run is younger than this many hours.",
+    ),
 ) -> None:
     """Backtest on stored candles (30 days, incremental sync first)."""
     from wallexer.cli.backtest_cmds import run_walk_forward
@@ -245,7 +264,24 @@ def backtest(
     if not walk_forward:
         console.print("Only --walk-forward is implemented: `wallexer backtest --walk-forward`.")
         raise typer.Exit(1)
-    asyncio.run(run_walk_forward(load_settings(), console))
+    settings = load_settings()
+    if if_older_than > 0:
+        from datetime import UTC, datetime
+
+        from wallexer.backtest.report import latest_run
+        from wallexer.store.db import init_db
+
+        conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
+        row = latest_run(conn)
+        conn.close()
+        if row is not None:
+            age_h = (datetime.now(UTC) - datetime.fromisoformat(row["ts"])).total_seconds() / 3600
+            if age_h < if_older_than:
+                console.print(
+                    f"Latest walk-forward run #{row['id']} is {age_h:.1f} h old: skipped."
+                )
+                return
+    asyncio.run(run_walk_forward(settings, console))
 
 
 research_app = typer.Typer(help="Research studies (read-only, no orders).", no_args_is_help=True)
@@ -457,6 +493,47 @@ def watch() -> None:
     from wallexer.cli.watch import run_watch
 
     run_watch(load_settings())
+
+
+@app.command()
+@friendly
+def resume() -> None:
+    """Lift a hard drawdown stop (human decision). Drawdown is measured again from current equity."""
+    from wallexer.cli.engine_cmds import sock
+    from wallexer.engine import control
+    from wallexer.store.db import init_db, log_event
+
+    settings = load_settings()
+    if (
+        console.input("Lift the hard stop and allow new entries again? Type RESUME: ").strip()
+        != "RESUME"
+    ):
+        console.print("Not confirmed.")
+        raise typer.Exit(1)
+    try:
+        console.print(control.send(sock(settings), "resume"))
+    except control.EngineNotRunning:
+        conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
+        log_event(conn, "control.resume", {"by": "human", "engine": "not running"})
+        conn.close()
+        console.print("Recorded; the engine will start without the hard stop.")
+
+
+@app.command()
+@friendly
+def health() -> None:
+    """Print the engine's /health JSON (handy inside the container: no quoting needed)."""
+    import os
+    import urllib.request
+
+    port = os.environ.get("PORT", str(load_settings().cfg.engine.health_port))
+    try:
+        console.print(
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5).read().decode()
+        )
+    except OSError as e:
+        console.print(f"[red]health endpoint unreachable on :{port}[/] ({e})")
+        raise typer.Exit(1) from None
 
 
 def main() -> None:

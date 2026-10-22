@@ -17,3 +17,10 @@ Liara is an Iranian PaaS with a CLI (`liara`, installed via `npm install -g @lia
 - `liara deploy` and `liara env` changes require the user's confirmation.
 - Never deploy in `trade` mode without the user explicitly saying so. Default deploy mode is `shadow`.
 - After each deploy: check logs, hit `/health`, run `wallexer doctor` in the container.
+
+## Verified setup (2026-10-22)
+- A private network is required before `app create`: `liara network create -n wallexer-net`, then `app create ... -n wallexer-net`.
+- `app create` needs a feature bundle: API ids `free | standard | pro` (the interactive prompt labels them differently; prices for standard-base-g2: 0 / 825,000 / 1,475,000 TMN/month). We use `--feature-plan standard`.
+- Non-interactive create: `liara app create -a wallexer --platform docker --plan standard-base-g2 --feature-plan standard -n wallexer-net -r false`.
+- Build location `iran` (user choice). Image: `Dockerfile` (python 3.12-slim + uv, `uv sync --frozen --no-dev`), start script `deploy/entrypoint.sh`, config `liara.json` (port 8000, disk `data` → `/app/data`).
+- Step-by-step operations: `docs/RUNBOOK.md`.

@@ -1,0 +1,15 @@
+{
+  "platform": "docker",
+  "app": "wallexer",
+  "port": 8000,
+  "build": {
+    "location": "iran"
+  },
+  "disks": [
+    {
+      "name": "data",
+      "mountTo": "/app/data"
+    }
+  ],
+  "team-id": "6ad87ba7cf87f9a8e45d4d3a"
+}

@@ -13,17 +13,41 @@ class ApiError(WallexError):
     """Non-success response (HTTP error or success=false envelope)."""
 
     def __init__(
-        self, status: int, message: str, code: int | None = None, fields: Any = None
+        self,
+        status: int,
+        message: str,
+        code: int | None = None,
+        fields: Any = None,
+        body: Any = None,
     ) -> None:
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.message = message
         self.code = code
         self.fields = fields or {}
+        self.body = body  # the complete error response, as received (for logs and diagnosis)
+
+    def detail(self) -> dict[str, Any]:
+        """Everything the exchange said: status, code, message, per-field result, raw body."""
+        return {
+            "status": self.status,
+            "code": self.code,
+            "message": self.message,
+            "result": self.fields,
+            "body": self.body,
+        }
 
 
 class TransportError(WallexError):
     """Network failure or non-JSON body (e.g. an nginx 503 HTML page)."""
+
+
+class ResponseShapeError(WallexError):
+    """A response did not match the expected shape; `raw` holds what was received."""
+
+    def __init__(self, what: str, error: str, raw: Any) -> None:
+        super().__init__(f"unexpected {what} response shape: {error}")
+        self.raw = raw
 
 
 class OrdersDisabled(WallexError):

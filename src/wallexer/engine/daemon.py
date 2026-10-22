@@ -149,6 +149,16 @@ class Engine:
         log.info("engine.preflight", msg=self.credit.message, first_start=first)
         if self.event_end is None:
             log_event(self.conn, "engine.no_event_end", {})
+        # A hard stop survives restarts: it is only lifted by a human `wallexer resume`.
+        last_stop = self.conn.execute(
+            "SELECT MAX(id) FROM events WHERE kind='risk.hard_stop'"
+        ).fetchone()[0]
+        last_resume = self.conn.execute(
+            "SELECT MAX(id) FROM events WHERE kind='control.resume'"
+        ).fetchone()[0]
+        if last_stop and (last_resume is None or last_stop > last_resume):
+            self.hard_stopped = True
+            log_event(self.conn, "engine.hard_stop_persisted", {"hard_stop_event": last_stop})
         # trading-credit package restrictions
         upath = cfg.path(cfg.universe.unavailable_path)
         try:
@@ -1270,11 +1280,14 @@ class Engine:
         }
 
     def health(self) -> dict[str, Any]:
+        """Served from the very start (before startup finishes) so the platform sees a live port."""
+        feed = getattr(self, "feed", None)
         return {
             "mode": self.mode.value,
+            "starting": self.last_tick is None,
             "last_tick": self.last_tick,
             "equity_tmn": f"{self.equity:.0f}",
-            "errors": self.errors + self.feed.errors,
+            "errors": self.errors + (feed.errors if feed else 0),
             "ok": self.last_tick is not None and time.time() - self.last_tick < 30,
         }
 
@@ -1313,6 +1326,12 @@ class Engine:
                 {"guardrails": fresh.cfg.guardrails.model_dump(mode="json")},
             )
             return {"ok": True, "reloaded": "guardrails"}
+        if cmd == "resume":
+            self.hard_stopped = False
+            self.flatten_requested = None
+            self.peak_equity = self.equity  # drawdown is measured again from here
+            log_event(self.conn, "control.resume", {"equity": str(self.equity), "by": "human"})
+            return {"ok": True, "resumed": True}
         if cmd == "ping":
             return {"ok": True, "mode": self.mode.value}
         if cmd == "status":
@@ -1353,6 +1372,73 @@ class Engine:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self.stopping.wait(), timeout=delay)
 
+    async def _walk_forward_rerun(self) -> None:
+        """Re-run the walk-forward in a low-priority subprocess, then reload its selection.
+
+        Promotion uses the new OOS stats/age. An unpromoted strategy whose selection changed is
+        rebuilt (fresh paper book); a promoted one keeps running unchanged until restart.
+        """
+        import sys
+
+        log_event(self.conn, "backtest.rerun_started", {})
+        proc = await asyncio.create_subprocess_exec(
+            "nice",
+            "-n",
+            "10",
+            sys.executable,
+            "-m",
+            "wallexer.cli.app",
+            "backtest",
+            "--walk-forward",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.settings.cfg.path(".")),
+        )
+        _out, err = await proc.communicate()
+        if proc.returncode != 0:
+            log_event(
+                self.conn,
+                "backtest.rerun_failed",
+                {"code": proc.returncode, "stderr": (err or b"").decode()[-400:]},
+            )
+            return
+        old = {n: v.get("update") for n, v in self.wf["strategies"].items()}
+        self.wf = self._load_walk_forward()
+        sc, g = self.settings.cfg.strategies, self.settings.cfg.guardrails
+        rebuilt = []
+        for name, cls in (("mean_reversion", MeanReversion), ("momentum", Momentum)):
+            new_upd = self.wf["strategies"].get(name, {}).get("update", {})
+            st = self.statuses.get(name)
+            if new_upd != old.get(name) and not (st and st.promoted):
+                cfg = getattr(sc, name).model_copy(update=new_upd)
+                self.strategy_cfg[name] = cfg
+                self.strategies = [x if x.name != name else cls(cfg, g) for x in self.strategies]
+                self.books[name] = self._new_book(name, "shadow")
+                rebuilt.append(name)
+        self._age_events.clear()
+        log_event(
+            self.conn, "backtest.rerun_done", {"run_id": self.wf.get("run_id"), "rebuilt": rebuilt}
+        )
+        self.trigger_agent("walk_forward_rerun")
+
+    async def _rerun_loop(self) -> None:
+        b = self.settings.cfg.backtest
+        every = b.rerun_every_h * 3600
+        age = self._run_age_h()
+        # First run soon after start when there is no run or it is getting old (fresh server).
+        wait = 120.0 if age is None or age >= b.warn_run_age_h else every
+        while not self.stopping.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.stopping.wait(), timeout=wait)
+            wait = every
+            if self.stopping.is_set():
+                return
+            try:
+                await self._walk_forward_rerun()
+            except Exception as e:  # a failed re-run must not affect trading
+                self.errors += 1
+                log_event(self.conn, "backtest.rerun_failed", {"error": str(e)[:300]})
+
     async def _depth_and_tick(self) -> None:
         await self.feed.poll_depth()
         await self.tick()
@@ -1371,9 +1457,10 @@ class Engine:
         servers: list[asyncio.AbstractServer] = []
         sock = self.settings.cfg.path(ecfg.socket_path)
         try:
+            # Health first: the platform must see the port while startup (sync, preflight) runs.
+            servers.append(await health.serve(ecfg.health_port, self.health))
             await self.startup()
             servers.append(await control.serve(sock, self.handle))
-            servers.append(await health.serve(ecfg.health_port, self.health))
             tasks = [
                 asyncio.create_task(
                     self._every(self.feed.depth_interval, self._depth_and_tick, "tick")
@@ -1391,6 +1478,8 @@ class Engine:
                     self._every(ecfg.reconcile_interval_s, self._reconcile, "reconcile")
                 ),
             ]
+            if self.settings.cfg.backtest.rerun_every_h > 0:
+                tasks.append(asyncio.create_task(self._rerun_loop()))
             if self.settings.cfg.agent.enabled:
                 self.agent_event = asyncio.Event()
                 # first decision ~90 s after start, once promotions/regime/allocation exist

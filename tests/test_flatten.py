@@ -93,3 +93,82 @@ def test_blocked_market_is_not_used_and_reported():
 def test_only_selected_assets():
     p = plan({"BTC": D("0.01"), "ETH": D("0.5")}, only_assets=frozenset({"ETH"}))
     assert [o.symbol for o in p.orders] == ["ETHTMN"]
+
+
+async def test_end_of_event_flatten_schedule(tmp_path):
+    """Engine wiring at T-25 min: the schedule requests a flatten, every non-TMN balance (incl.
+    USDT) is sold to TMN via the executor, dust is accepted and logged, and entries are blocked."""
+    from datetime import UTC, datetime
+
+    from wallexer.config import AppConfig, Mode, Secrets, Settings, StoreCfg
+    from wallexer.engine.daemon import Engine
+    from wallexer.exchange.fees import parse_fee_table
+    from wallexer.exchange.models import Side
+    from wallexer.execution.paper import FillModel
+    from wallexer.execution.shadow import ShadowExecutor
+    from wallexer.risk import gate
+    from wallexer.risk.guardrails import Limits
+
+    end = datetime(2026, 10, 23, 20, 0, tzinfo=UTC)
+    settings = Settings(
+        cfg=AppConfig(
+            store=StoreCfg(db_path=str(tmp_path / "t.db"), overrides_path=str(tmp_path / "o.toml"))
+        ),
+        secrets=Secrets.model_construct(event_end_utc=end, wallexer_mode=Mode.shadow),
+    )
+    eng = Engine(settings, Mode.shadow)
+    rules = {k: v for k, v in RULES.items() if k in ("BTCTMN", "USDTTMN", "ETHTMN")}
+    rules["XAUTTMN"] = MarketRules("XAUTTMN", "XAUT", "TMN", 0, 3)
+    books = dict(BOOKS) | {"XAUTTMN": bk("400000000", "401000000")}
+    eng.symbols = list(rules)
+    eng.all_rules = rules
+    eng.forbidden = eng.unavailable = frozenset()
+    eng.fees = parse_fee_table({}, D("0.003"), D("0.003"))
+    eng.limits = Limits.from_settings(settings, forbidden=frozenset(), unavailable=frozenset())
+
+    class FeedStub:
+        pass
+
+    eng.feed = FeedStub()
+    eng.feed.books = books
+    start = {"TMN": D(4_000_000), "BTC": D("0.00004"), "USDT": D(3), "XAUT": D("0.000002")}
+    eng.executor = ShadowExecutor(
+        eng.conn, eng.fees, FillModel(D(0)), start, {s: r.base_asset for s, r in rules.items()}
+    )
+    eng.account = await eng.executor.snapshot()
+    eng.equity = eng._account_equity()
+    eng.peak_equity = eng.day_start_equity = eng.equity
+
+    t_minus_25 = end.timestamp() - 25 * 60
+    eng._risk_monitor(t_minus_25)
+    assert eng.flatten_requested == set()
+    assert (
+        eng.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='schedule.force_flatten'"
+        ).fetchone()[0]
+        == 1
+    )
+
+    await eng.flatten(set(), "schedule")  # sells BTC (MARKET) and USDT; XAUT is dust (< 1000 TMN)
+    eng.account = await eng.executor.snapshot()
+    assert eng.account.free.get("BTC", 0) == 0 and eng.account.free.get("USDT", 0) == 0
+    assert eng.account.free["XAUT"] == D("0.000002")  # 0.000002 * 4e8 = 800 TMN dust
+    await eng.flatten(set(), "schedule")  # next tick: nothing left to sell → done
+    assert eng.flatten_requested is None
+    kinds = [r[0] for r in eng.conn.execute("SELECT kind FROM events")]
+    assert "flatten.dust_accepted" in kinds and "flatten.done" in kinds
+    sides = {r[0] for r in eng.conn.execute("SELECT side FROM orders")}
+    assert sides == {"SELL"}
+    assert all(r[0] is not None for r in eng.conn.execute("SELECT decision_id FROM orders"))
+
+    # entries are blocked from T-90 min
+    st = eng._risk_state(end.timestamp() - 89 * 60)
+    r = gate.check(
+        gate.Intent("BTCTMN", Side.BUY, D("0.0001"), D("20000000000"), is_exit=False),
+        st,
+        eng.limits,
+        rules["BTCTMN"],
+    )
+    assert not r.approved and "end of event" in r.reason
+    await eng.client.aclose()
+    eng.conn.close()

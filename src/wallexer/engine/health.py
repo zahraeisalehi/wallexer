@@ -10,8 +10,10 @@ from typing import Any
 
 
 async def serve(port: int, snapshot: Callable[[], dict[str, Any]]) -> asyncio.AbstractServer:
-    # Bind publicly only when the platform provides PORT (Liara); locally stay on loopback.
-    host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+    # Bind publicly in the container (Liara's proxy must reach it) or when the platform sets
+    # PORT; locally stay on loopback.
+    public = "PORT" in os.environ or os.environ.get("WALLEXER_IN_CONTAINER") == "1"
+    host = "0.0.0.0" if public else "127.0.0.1"
 
     async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
