@@ -132,3 +132,104 @@ def test_clamp_llm_weights():
     assert sum(w.values()) == 1 and w["a"] == w["b"]
     # unpromoted (not allowed) strategies cannot receive weight
     assert clamp_weights({"a": 0.5}, allowed=[], max_weight=D(1)) == {}
+
+
+# --- LLM agent decisions can only shrink risk ---------------------------------------------
+
+
+def _decision(**kw):
+    from wallexer.agent.schema import AgentDecision
+
+    base = dict(
+        stance="active",
+        strategy_weights={"basis_tmn_usdt": 1.0, "mean_reversion": 0.9, "momentum": 0.4},
+        active_markets=[],
+        pause_markets=[],
+        risk_multiplier=1.0,
+        rationale="test",
+        watch_requests=[],
+    )
+    base.update(kw)
+    return AgentDecision.model_validate(base)
+
+
+def _apply(d, promoted=("momentum",), engine_rm=D(1)):
+    from wallexer.agent.agent import apply_decision
+
+    return apply_decision(
+        d,
+        promoted=promoted,
+        paper_only=["basis_tmn_usdt"],
+        max_weight=D("0.6"),
+        engine_risk_multiplier=engine_rm,
+        universe=["BTCTMN", "ETHTMN", "USDTTMN"],
+        max_watch_books=3,
+    )
+
+
+def test_agent_weights_only_for_promoted_and_clamped():
+    a = _apply(_decision())
+    assert a.weights == {"momentum": D("0.4")}  # mean_reversion unpromoted, basis paper-only
+    assert any("not promoted" in n for n in a.notes)
+    a = _apply(
+        _decision(strategy_weights={"basis_tmn_usdt": 0, "mean_reversion": 0, "momentum": 1.0})
+    )
+    assert a.weights == {"momentum": D("0.6")}  # clamped to max_strategy_weight
+    assert _apply(_decision(), promoted=()).weights == {}
+
+
+def test_agent_flat_stance_zeroes_weights():
+    a = _apply(_decision(stance="flat"))
+    assert all(w == 0 for w in a.weights.values())
+
+
+def test_agent_risk_multiplier_can_only_lower():
+    assert _apply(_decision(risk_multiplier=1.0), engine_rm=D("0.5")).risk_multiplier == D("0.5")
+    assert _apply(_decision(risk_multiplier=0.3), engine_rm=D("0.5")).risk_multiplier == D("0.3")
+
+
+def test_agent_pauses_and_active_markets_only_restrict():
+    a = _apply(_decision(pause_markets=["ethtmn", "FAKE"], active_markets=["BTCTMN", "NOPE"]))
+    assert a.agent_paused == {"ETHTMN"}  # unknown markets cannot be added
+    assert a.active_markets == {"BTCTMN"}
+    assert (
+        _apply(_decision(active_markets=["NOPE"])).active_markets is None
+    )  # invalid → no restriction
+
+
+def test_agent_watch_requests_limited_to_universe_and_max():
+    reqs = [
+        {"strategy": "momentum", "timeframe": 15, "market": m, "action": "paper", "why": "x"}
+        for m in ("BTCTMN", "ETHTMN", "USDTTMN", "BTCTMN")
+    ] + [
+        {
+            "strategy": "mean_reversion",
+            "timeframe": 60,
+            "market": "XAUTTMN",
+            "action": "recheck",
+            "why": "y",
+        }
+    ]
+    a = _apply(_decision(watch_requests=reqs))
+    assert len(a.watch_paper) == 3 and a.watch_recheck == []  # XAUTTMN not in this universe
+
+
+def test_agent_schema_rejects_out_of_range():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _decision(risk_multiplier=1.5)
+    with pytest.raises(ValidationError):
+        _decision(strategy_weights={"basis_tmn_usdt": 0, "mean_reversion": 0, "momentum": -0.1})
+    with pytest.raises(ValidationError):
+        _decision(
+            watch_requests=[
+                {
+                    "strategy": "momentum",
+                    "timeframe": 7,
+                    "market": "BTCTMN",
+                    "action": "paper",
+                    "why": "",
+                }
+            ]
+        )

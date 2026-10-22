@@ -213,3 +213,29 @@ def study(
                 st.max_size.append(float(max_size_tmn(cyc, legs)) if st.taker_bps[-1] > 0 else 0.0)
             out.append(st)
     return out
+
+
+def markdown(res: list[DirectionStats], n_cycles: int, span_h: float, skew: float) -> str:
+    """Report for the submission export."""
+    lines = [
+        "# Triangle basis study",
+        "",
+        f"{n_cycles} simultaneous snapshot cycles over {span_h:.2f} h (max intra-cycle skew {skew:.2f} s).",
+        "Net edge in bps of the TMN put in; all taker = executable top of book incl. spreads and 3 taker fees.",
+        "",
+        "| Base | Dir | Taker p50 | Taker max | % > 0 | Mix best max | @200k max | Runs > 0 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for st in res:
+        a2 = [v for v in st.at200k_bps if v is not None]
+        lines.append(
+            f"| {st.base} | {st.direction} | {pct(st.taker_bps, 0.5):.1f} | {max(st.taker_bps):.1f} | "
+            f"{sum(v > 0 for v in st.taker_bps) / len(st.taker_bps) * 100:.1f}% | {max(st.mix_bps):.1f} | "
+            f"{max(a2) if a2 else float('nan'):.1f} | {len(st.runs())} |"
+        )
+    hits = sum(len([r for r in st.runs() if r[0] >= 2]) for st in res)
+    lines += [
+        "",
+        f"**Verdict:** {'YES' if hits else 'NO'} repeatable positive all-taker opportunity at >= 200,000 TMN.",
+    ]
+    return "\n".join(lines) + "\n"

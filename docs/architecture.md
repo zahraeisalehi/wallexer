@@ -68,24 +68,29 @@ USDT-quoted markets are the cheap fee tier (0.10/0.13% vs 0.25/0.30% on TMN), bu
 - **Universe ranking** stays per-trade (round trip without conversion); `wallexer markets` also shows "RT incl. USDT conv" (round trip + one full cycle, worst case) for USDT markets.
 
 ### LLM agent (the "AI substantively changes decisions" part)
-Every `agent_interval_min` (and on risk events) the agent receives a compact JSON snapshot:
-scoreboard, regime probabilities, per-market spread/vol/volume, current exposure, drawdown, recent errors.
-It must return JSON matching this schema (validated with pydantic, temperature 0):
-```json
-{
-  "strategy_weights": {"basis_tmn_usdt": 0.5, "mean_reversion": 0.3, "momentum": 0.2},
-  "active_markets": ["BTCTMN", "ETHTMN", "USDTTMN"],
-  "risk_multiplier": 0.8,
-  "pause_markets": [],
-  "rationale": "short text"
-}
-```
-- Final weights = agent weights clamped to guardrail bounds. If the call fails, times out, or is invalid → baseline weights, logged as `fallback`.
-- **Both baseline and agent weights are logged every cycle**, so we can show where and how much the agent changed decisions, and compare agent vs no-agent in backtest.
+Implemented in `agent/`. Every `agent.interval_min` (30) and on risk events (drawdown steps, soft/hard stop,
+feed-error bursts, promotion/demotion; debounced to 5 min) the agent gets an **anonymized** snapshot
+(percentages and bps only: equity % of start, drawdown, exposure; per strategy OOS + shadow stats and
+promotion state; regime percentiles; per market spread / 15-min vol / round trip / book health; event
+counts; hours to event end). BoxAPI `gpt-5.4-mini`, temperature 0, strict `json_schema`, validated with
+pydantic; one retry with the error appended, then fallback to the baseline (logged `agent_fallback`).
+
+Output: `stance` (flat|active), `strategy_weights`, `risk_multiplier` (0–1), `pause_markets`,
+`active_markets`, `rationale`, `watch_requests` (strategy × timeframe × market, `paper` | `recheck`).
+Applied **shrink-only** (`agent.apply_decision`, covered by critical test 2):
+- weights only for promoted strategies, always through `risk.clamp_weights`; stance flat → all 0;
+- effective risk multiplier = min(engine, agent);
+- agent pauses are added to (never remove) human pauses; `active_markets` only restricts new entries;
+- `paper` watch requests run up to 3 extra shadow paper books; `recheck` requests are shown first by the
+  next `backtest --walk-forward`. This is how the agent changes what evidence is gathered even while flat.
+
+Every cycle writes a `decisions` row (`agent_decision`: trigger, prompt hash, decision, before → after
+effects) and every allocation cycle an `allocations` row (baseline, agent, final, source, llm_call_id).
+`status` shows stance, rationale and the baseline → agent → final weight diff.
 
 ### Reproducibility of LLM calls
 - Every request/response is stored in table `llm_calls` with a hash of the prompt.
-- `--replay` mode reads recorded responses instead of calling the API, so a run is bit-for-bit repeatable.
+- `--replay` mode (`wallexer engine run --replay`, `llm.replay = true`) reads recorded responses by prompt hash instead of calling the API; a miss is a logged fallback. `wallexer agent replay <llm_call_id>` re-runs a recorded prompt offline and checks the decision is identical.
 - Backtests call the agent at a coarse cadence (default hourly) to keep cost and time sane.
 
 ## 3. Risk gate (defaults; editable via `config guardrail`)
@@ -120,9 +125,14 @@ The risk gate can only reduce or reject orders, never enlarge them. It runs afte
 - Before `trade` starts, the CLI asks whether a recent backtest + shadow run exists (human-in-the-loop prompt; user may proceed).
 
 ## 6. CLI commands
-`trade [market]`, `stop [market]`, `shadowtest`, `backtest [--from --to]`, `change <from> <to>`,
-`status`, `watch` (live dashboard), `rslt <backtest|shadowtest>`, `log [n]`, `reason [n]`, `exp-reason [n]`,
-`config guardrail`, `autoset guardrail`, `markets`, `flatten [market]`, `doctor`, `export`.
+Trading: `trade [market]`, `stop [market]`, `shadowtest [market]`, `flatten [market]`, `change <from> <to>` (all 6
+transitions; trade targets ask the human-in-the-loop question and a typed confirmation before anything stops),
+`engine run --mode shadow|trade [--replay]`.
+Evidence: `history sync`, `backtest --walk-forward`, `research basis`, `research spread [--collect --hours H]`.
+Results/logs: `status`, `rslt <backtest|shadowtest>`, `log [n]`, `reason [n]` (static), `exp-reason [n]` (LLM,
+anonymized, fixed format), `export` (zip; never `.env`).
+Agent: `agent now`, `agent replay <id>`. Config: `config guardrail` (bounded, applied live via `reload`),
+`autoset guardrail` (LLM suggestions, user accepts all/some/none). Setup: `markets`, `doctor`.
 
 ## 7. Storage (SQLite, WAL)
 `candles`, `depth_snapshots`, `orders`, `fills`, `decisions`, `strategy_paper_pnl`, `paper_trades` (closed paper trades per strategy with `source` backtest|shadow and `kind` trade|cycle|conversion; feeds the promotion gate), `allocations`, `llm_calls`, `equity_curve`, `events` (incl. `flatten.dust_accepted`, `feed.book_crossed`/`feed.book_stale`, `risk.*`).

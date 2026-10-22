@@ -149,6 +149,7 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         run_id = report.persist(conn, wf, settings, path)
         path.write_text(report.markdown(wf, settings, fees, run_id), encoding="utf-8")
+        _print_rechecks(conn, wf, console)
         report.render(wf, settings, fees, console, run_id)
         console.print(f"[dim]report: {path}[/]")
     finally:
@@ -234,3 +235,139 @@ async def run_basis_study(settings: Settings, console: Console) -> None:
         console.print(
             "[red]Verdict: NO repeatable, positive, net-of-fee all-taker opportunity at >= 200,000 TMN in this sample.[/]"
         )
+
+
+async def run_spread_scan(
+    settings: Settings, console: Console, collect: bool, hours: float
+) -> None:
+    """Research: spread-capture scan (collect books/trades, or analyze what was collected)."""
+    from wallexer.research import spread_scan as sc
+
+    cfg = settings.cfg
+    conn = init_db(cfg.path(cfg.store.db_path))
+    conn.executescript(sc.SCHEMA)
+    try:
+        async with WallexClient(settings) as client:
+            symbols = await sc.scan_symbols(client, settings)
+            if collect:
+                console.print(
+                    f"Collecting books + trades for {len(symbols)} markets for {hours} h "
+                    f"(≤ {sc.SCAN_CALLS_PER_WINDOW} calls / {sc.WINDOW_S:.0f} s)."
+                )
+                await sc.collect(client, conn, symbols, hours)
+                return
+            fees = await client.fees()
+            quotes = {m.symbol: m.quote_asset for m in await client.markets()}
+        res = sc.analyze(conn, fees, quotes)
+    finally:
+        conn.close()
+    if not res:
+        conn = init_db(cfg.path(cfg.store.db_path))
+        n, t0, t1 = conn.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM scan_books").fetchone()
+        conn.close()
+        if not n:
+            console.print(
+                "No scan data yet: run `wallexer research spread --collect --hours 4` first."
+            )
+        else:
+            console.print(
+                f"{n} book samples over {(t1 - t0) / 60:.0f} min: not enough yet. Each attempt needs "
+                f"{max(sc.HORIZONS_MIN)} min of follow-up data; rerun later."
+            )
+        return
+    span = res and max(m.books for m in res)
+    t = Table(
+        header_style="bold cyan",
+        title=f"Spread capture scan · {len(res)} markets · up to {span} book samples each",
+    )
+    for col in (
+        "Market",
+        "Maker %",
+        "Spread med/p25 bps",
+        "Net edge bps",
+        "Prints/h",
+        "Attempts",
+        "Both filled through 5/15/30m",
+        "Both filled touch 15m",
+        "|Drift| 15m med/p90 bps",
+        "E[15m] bps",
+        "Pass",
+    ):
+        t.add_column(col, justify="right")
+    for m in res:
+        t.add_row(
+            m.symbol,
+            f"{m.maker_fee * 100:.2f}",
+            f"{m.spread_med:.1f} / {m.spread_p25:.1f}",
+            f"[green]{m.net_edge_med:.1f}[/]" if m.net_edge_med > 10 else f"{m.net_edge_med:.1f}",
+            f"{m.trades_per_h:.0f}",
+            str(m.attempts),
+            " / ".join(f"{m.fill_through[h] * 100:.0f}%" for h in sc.HORIZONS_MIN),
+            f"{m.fill_touch[15] * 100:.0f}%",
+            f"{m.drift_med[15]:.1f} / {m.drift_p90[15]:.1f}",
+            f"{m.expectancy_15:+.1f}",
+            "[green]✓[/]" if m.passes else "",
+        )
+    console.print(t)
+    console.print(
+        "[dim]Net edge = median spread − 2 × maker fee. Both filled = a resting bid at best bid AND ask at "
+        "best ask were both traded through (<, >) within the horizon; touch = at or through (optimistic, "
+        "ignores queue). E[15m] = mean per-attempt result in bps: both fill → spread − 2 maker; one side → "
+        "maker in, taker out at the book 15 min later; none → 0. Prints may be undercounted on very busy "
+        "markets (/v1/trades returns only the latest prints per poll). USDT markets also carry the USDT "
+        "conversion cost.[/]"
+    )
+    winners = [m for m in res if m.passes]
+    if winners:
+        console.print(
+            "[green]Candidates (net edge > 10 bps, two-sided through-fills ≥ 30% in 15 min, p90 drift < edge): "
+            + ", ".join(f"{m.symbol} (E {m.expectancy_15:+.1f} bps)" for m in winners)
+            + "[/]"
+        )
+    else:
+        console.print(
+            "[red]Verdict: no market shows net edge > 10 bps with frequent two-sided fills and low drift.[/]"
+        )
+
+
+def _print_rechecks(conn, wf, console: Console) -> None:
+    """The LLM agent's 'recheck' requests (last 24 h), shown first with their IS/OOS rows."""
+    import json as _json
+
+    since = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+    reqs = {
+        (p["strategy"], int(p["timeframe"]), p["market"])
+        for (p_s,) in conn.execute(
+            "SELECT payload FROM events WHERE kind='agent.recheck_request' AND ts >= ?", (since,)
+        )
+        for p in [_json.loads(p_s)]
+    }
+    if not reqs:
+        return
+    from wallexer.alloc.promotion import stats
+
+    t = Table(
+        title="Agent recheck requests (best IS params of that strategy × timeframe, per market)",
+        header_style="bold magenta",
+    )
+    for col in ("Strategy", "TF", "Market", "Params", "IS n / net", "OOS n / net"):
+        t.add_column(col)
+    for strat, tf, market in sorted(reqs):
+        rs = [r for r in wf.results if r.strategy == strat and r.timeframe == tf]
+        if not rs:
+            t.add_row(strat, f"{tf}m", market, "not in grid", "–", "–")
+            continue
+        best = max(rs, key=lambda r: stats(r.is_.by_market().get(market, [])).net)
+        si, so = (
+            stats(best.is_.by_market().get(market, [])),
+            stats(best.oos.by_market().get(market, [])),
+        )
+        t.add_row(
+            strat,
+            f"{tf}m",
+            market,
+            str(best.params),
+            f"{si.n} / {si.net:,.0f}",
+            f"{so.n} / {so.net:,.0f}",
+        )
+    console.print(t)
