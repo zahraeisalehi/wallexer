@@ -93,6 +93,28 @@ CREATE TABLE IF NOT EXISTS strategy_paper_pnl (
 );
 CREATE INDEX IF NOT EXISTS ix_paper_strategy_ts ON strategy_paper_pnl(strategy, ts);
 
+-- Closed paper trades per strategy (needed by the promotion gate; addition to arch §7).
+-- source: backtest (startup replay) | shadow (live-data paper). kind: trade | cycle | conversion.
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id          INTEGER PRIMARY KEY,
+    run_id      TEXT,
+    strategy    TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    market      TEXT NOT NULL,
+    qty         TEXT NOT NULL,
+    entry_ts    TEXT NOT NULL,
+    exit_ts     TEXT NOT NULL,
+    entry_px    TEXT NOT NULL,
+    exit_px     TEXT NOT NULL,
+    fees_tmn    TEXT NOT NULL,
+    gross_tmn   TEXT NOT NULL,
+    net_tmn     TEXT NOT NULL,
+    entry_reason TEXT NOT NULL DEFAULT '{}',
+    exit_reason TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS ix_paper_trades_strategy ON paper_trades(strategy, source, exit_ts);
+
 CREATE TABLE IF NOT EXISTS allocations (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
@@ -163,6 +185,9 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")  # CLI and engine share the file
+    # WAL + NORMAL: no fsync per commit (only at checkpoints). A crash can lose the last few
+    # commits but never corrupts the DB; FULL made per-row candle inserts take minutes.
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 

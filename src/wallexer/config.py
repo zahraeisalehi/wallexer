@@ -40,7 +40,8 @@ class ExchangeCfg(BaseModel):
 
 
 class MarketLimitCfg(BaseModel):
-    window_s: float = 60.0
+    window_s: float = 39.0
+    limit: int = 600
     backoff_below_frac: float = 0.10
 
 
@@ -67,6 +68,8 @@ class OrdersCfg(BaseModel):
     exit_limit_slippage_pct: Decimal = Decimal("0.5")
     exit_reprice_after_s: float = 10
     exit_max_reprices: int = 5
+    # A remainder below this (TMN value) after a full sell is accepted as dust and logged.
+    dust_cap_tmn: Decimal = Decimal("1000")
 
 
 class FeesCfg(BaseModel):
@@ -78,6 +81,11 @@ class FeesCfg(BaseModel):
 
 class UniverseCfg(BaseModel):
     top_n: int = 30
+    # Default universe: markets where MARKET orders are enabled (exits can always be immediate).
+    # LIMIT-only markets are opt-in; their max position is halved.
+    include_limit_only: bool = False
+    max_markets: int = 12
+    unavailable_path: str = "data/unavailable_markets.txt"
     min_quote_volume_tmn: Decimal = Decimal("500000000")
     max_spread_bps: Decimal = Decimal("100")
     quote_assets: list[str] = ["TMN", "USDT"]
@@ -107,6 +115,71 @@ class GuardrailsCfg(BaseModel):
     flatten_force_min: int = 30
 
 
+class EngineCfg(BaseModel):
+    depth_interval_s: float = 3.0
+    trades_interval_s: float = 10.0
+    candles_interval_s: float = 60.0
+    allocator_interval_s: float = 60.0
+    reconcile_interval_s: float = 30.0
+    # Fraction of the market-data rate limit the feed may plan to use per window.
+    feed_budget_frac: float = 0.7
+    stale_after_intervals: float = 3.0
+    frozen_book_s: float = 60.0
+    socket_path: str = "data/engine.sock"
+    health_port: int = 8000
+    log_path: str = "data/logs/engine.log"
+    replay_days: int = 3
+
+
+class PaperCfg(BaseModel):
+    capital_tmn: Decimal = Decimal("5000000")
+    slippage_bps: Decimal = Decimal("2")
+    maker_timeout_s: float = 60.0
+    # Paper books never put more than this fraction of their equity into one position.
+    position_frac: Decimal = Decimal("0.2")
+
+
+class StrategyCfg(BaseModel):
+    enabled: bool = True
+    edge_margin_bps: Decimal = Decimal("10")
+    # mean_reversion
+    vwap_bars: int = 60
+    z_entry: float = 2.0
+    time_stop_min: int = 120
+    # momentum
+    breakout_bars: int = 30
+    vol_ratio_min: float = 1.5
+    imbalance_min: float = 0.1
+    atr_target_mult: float = 2.0
+    # all
+    atr_bars: int = 14
+    cooldown_min: int = 15
+
+
+class StrategiesCfg(BaseModel):
+    basis_tmn_usdt: StrategyCfg = StrategyCfg(edge_margin_bps=Decimal("5"))
+    mean_reversion: StrategyCfg = StrategyCfg()
+    momentum: StrategyCfg = StrategyCfg(time_stop_min=240)
+
+
+class PromotionCfg(BaseModel):
+    min_backtest_trades: int = 10
+    min_profit_factor: Decimal = Decimal("1.2")
+    min_shadow_trades: int = 3
+    demote_window_trades: int = 10
+    # Strategies that trade on paper but never get live weight (non-atomic legs).
+    paper_only: list[str] = ["basis_tmn_usdt"]
+
+
+class AllocCfg(BaseModel):
+    tau: float = 1.0
+    max_strategy_weight: Decimal = Decimal("0.6")
+    score_window_trades: int = 30
+    usdt_rebalance_band_pct: Decimal = Decimal("5")
+    usdt_min_hold_min: int = 60
+    usdt_breakeven_trades_per_cycle: Decimal = Decimal("2")
+
+
 class StoreCfg(BaseModel):
     db_path: str = "data/wallexer.db"
     overrides_path: str = "data/overrides.toml"
@@ -122,6 +195,11 @@ class AppConfig(BaseModel):
     llm: LlmCfg = LlmCfg()
     guardrails: GuardrailsCfg = GuardrailsCfg()
     store: StoreCfg = StoreCfg()
+    engine: EngineCfg = EngineCfg()
+    paper: PaperCfg = PaperCfg()
+    strategies: StrategiesCfg = StrategiesCfg()
+    promotion: PromotionCfg = PromotionCfg()
+    alloc: AllocCfg = AllocCfg()
 
     def path(self, rel: str) -> Path:
         """Resolve a config-relative path against the repo root."""

@@ -1,9 +1,13 @@
 """Trading-credit account checks.
 
 We trade only with the trading-credit (sub) account, which starts with ~5,000,000 TMN.
-Shadow and trade refuse to start unless the key + sub-account id are set and the account's
-equity is close to that. Equity (TMN + coins marked at best bid) is used rather than TMN alone,
-so a restart while holding positions can still start and trade back to TMN.
+- Key + sub-account id are always mandatory.
+- FIRST start (no trade-mode decisions/orders in the DB): the TMN balance alone must be ~5M,
+  otherwise shadow/trade refuse to start.
+- Later starts: equity and drawdown vs 5M are reported (warning only), so a restart while holding
+  positions can always start and trade back to TMN.
+Equity counts value + locked (assumption: `value` excludes funds locked in open orders; verify
+on the first live open order, double counting would hide drawdown).
 """
 
 from __future__ import annotations
@@ -34,6 +38,13 @@ class CreditCheck:
     unpriced: list[str] = field(default_factory=list)  # held assets we could not value
     locked: dict[str, Decimal] = field(default_factory=dict)
     message: str = ""
+    first_start: bool = True
+
+    @property
+    def drawdown_pct(self) -> Decimal:
+        if self.expected_tmn <= 0:
+            return Decimal(0)
+        return max(Decimal(0), (self.expected_tmn - self.equity_tmn) / self.expected_tmn * 100)
 
 
 def _bid(books: dict[str, Book], symbol: str) -> Decimal | None:
@@ -57,13 +68,17 @@ async def _books_for(client: WallexClient, assets: list[str]) -> dict[str, Book]
 def value_balances(
     balances: dict[str, Balance], books: dict[str, Book]
 ) -> tuple[Decimal, dict[str, Decimal], list[str]]:
-    """Return (TMN amount, {asset: value in TMN}, unpriced assets). Uses best bids (liquidation value)."""
-    tmn = balances[TMN].value if TMN in balances else Decimal(0)
+    """Return (TMN total, {asset: value in TMN}, unpriced assets).
+
+    Totals are value + locked; coins are marked at best bid (liquidation value).
+    """
+    tmn = (balances[TMN].value + balances[TMN].locked) if TMN in balances else Decimal(0)
     usdt_bid = _bid(books, "USDTTMN")
     valued: dict[str, Decimal] = {}
     unpriced: list[str] = []
     for asset, bal in balances.items():
-        if asset == TMN or bal.value <= 0:
+        total = bal.value + bal.locked
+        if asset == TMN or total <= 0:
             continue
         bid = _bid(books, f"{asset}TMN")
         if bid is None and asset != "USDT" and usdt_bid:
@@ -74,24 +89,34 @@ def value_balances(
         if bid is None:
             unpriced.append(asset)
         else:
-            valued[asset] = bal.value * bid
+            valued[asset] = total * bid
     return tmn, valued, unpriced
 
 
-async def check_trading_credit(client: WallexClient, settings: Settings) -> CreditCheck:
+async def check_trading_credit(
+    client: WallexClient, settings: Settings, *, first_start: bool = True
+) -> CreditCheck:
     acfg = settings.cfg.account
     balances = await client.balances()  # always sent with the sub-account header
-    held = [a for a, b in balances.items() if a != TMN and b.value > 0]
+    held = [a for a, b in balances.items() if a != TMN and (b.value + b.locked) > 0]
     books = await _books_for(client, held) if held else {}
     tmn, valued, unpriced = value_balances(balances, books)
     equity = tmn + sum(valued.values(), Decimal(0))
     lo = acfg.expected_equity_tmn * (1 - acfg.equity_tolerance_pct / 100)
     hi = acfg.expected_equity_tmn * (1 + acfg.equity_tolerance_pct / 100)
-    ok = lo <= equity <= hi
-    msg = (
-        f"equity {equity:,.0f} TMN (TMN {tmn:,.0f}) "
-        f"{'within' if ok else 'OUTSIDE'} {lo:,.0f}–{hi:,.0f}"
-    )
+    if first_start:
+        # First start: the TMN balance itself must be the ~5M credit.
+        ok = lo <= tmn <= hi
+        msg = f"first start: TMN {tmn:,.0f} {'within' if ok else 'OUTSIDE'} {lo:,.0f}–{hi:,.0f}"
+        if valued:
+            msg += f"; equity {equity:,.0f}"
+    else:
+        ok = True  # informational only on later starts
+        dd = (acfg.expected_equity_tmn - equity) / acfg.expected_equity_tmn * 100
+        msg = (
+            f"equity {equity:,.0f} TMN (TMN {tmn:,.0f}), {-dd:+.2f}% vs "
+            f"{acfg.expected_equity_tmn:,.0f}"
+        )
     if unpriced:
         msg += f"; unpriced: {', '.join(unpriced)}"
     locked = {a: b.locked for a, b in balances.items() if b.locked > 0}
@@ -105,17 +130,23 @@ async def check_trading_credit(client: WallexClient, settings: Settings) -> Cred
         unpriced,
         locked,
         msg,
+        first_start,
     )
 
 
-async def preflight_live(client: WallexClient, settings: Settings, mode: Mode) -> CreditCheck:
-    """Gate for starting shadow/trade. The engine must call this before its first tick."""
+async def preflight_live(
+    client: WallexClient, settings: Settings, mode: Mode, *, first_start: bool
+) -> CreditCheck:
+    """Gate for starting shadow/trade. The engine calls this before its first tick.
+
+    `first_start` = no trade-mode decisions/orders in the DB (store.repo.has_live_history).
+    """
     try:
         settings.require_private()
     except ConfigError as e:
         raise PreflightError(f"Cannot start {mode}: {e}") from e
     try:
-        check = await check_trading_credit(client, settings)
+        check = await check_trading_credit(client, settings, first_start=first_start)
     except (ApiError, TransportError) as e:
         raise PreflightError(f"Cannot start {mode}: balance check failed: {e}") from e
     if not check.ok:

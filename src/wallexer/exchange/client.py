@@ -148,12 +148,18 @@ class WallexClient:
         return resp
 
     async def _get(
-        self, path: str, *, params: dict[str, Any] | None = None, private: bool = False
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        private: bool = False,
+        retries: int | None = None,
     ) -> Any:
         ex = self.settings.cfg.exchange
+        n_retries = ex.get_retries if retries is None else retries
         params = {k: v for k, v in (params or {}).items() if v is not None}
         last_err: Exception | None = None
-        for attempt in range(ex.get_retries + 1):
+        for attempt in range(n_retries + 1):
             try:
                 resp = await self._send("GET", path, params=params, private=private)
                 if resp.status_code in _RETRY_STATUS:
@@ -162,7 +168,7 @@ class WallexClient:
                     return self._decode(resp)
             except httpx.TransportError as e:
                 last_err = TransportError(f"GET {path}: {type(e).__name__}: {e}")
-            if attempt < ex.get_retries:
+            if attempt < n_retries:
                 delay = ex.backoff_base_s * (2**attempt) * (1 + self._rng.random() * 0.25)
                 log.info("http.retry", path=path, attempt=attempt + 1, sleep_s=round(delay, 2))
                 await asyncio.sleep(delay)
@@ -182,9 +188,9 @@ class WallexClient:
                 log.warning("markets.skip_invalid", symbol=raw.get("symbol"), error=str(e)[:120])
         return out
 
-    async def depth_all(self) -> dict[str, Book]:
+    async def depth_all(self, retries: int | None = None) -> dict[str, Book]:
         # Sent with the key when available: unauthenticated calls returned nginx 503 in testing.
-        body = await self._get("/depth/all", private=self.settings.has_private)
+        body = await self._get("/depth/all", private=self.settings.has_private, retries=retries)
         return {sym: Book.model_validate(b) for sym, b in (body.get("result") or {}).items() if b}
 
     async def depth(self, symbol: str) -> Book:
@@ -228,6 +234,19 @@ class WallexClient:
                 source=table.source,
             )
         return table
+
+    # ------------------------------------------------------------------ trading-credit package
+    # Read-only. Used only to find our package's unavailable markets (user-confirmed endpoints).
+
+    async def prop_packages(self) -> list[dict[str, Any]]:
+        body = await self._get("/v1/prop/packages", private=True)
+        result = body.get("result")
+        return result if isinstance(result, list) else []
+
+    async def prop_package(self, package_id: int) -> dict[str, Any]:
+        body = await self._get(f"/v1/prop/packages/{int(package_id)}", private=True)
+        result = body.get("result")
+        return result if isinstance(result, dict) else {}
 
     # ------------------------------------------------------------------ orders (private)
 

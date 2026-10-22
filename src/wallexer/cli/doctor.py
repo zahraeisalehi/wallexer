@@ -16,8 +16,10 @@ from wallexer.config import ConfigError, Settings
 from wallexer.exchange.account import check_trading_credit
 from wallexer.exchange.client import WallexClient
 from wallexer.exchange.errors import ApiError, TransportError
+from wallexer.exchange.prop import fetch_package, save_unavailable
 from wallexer.exchange.universe import load_not_allowed, market_allowed
 from wallexer.store.db import init_db
+from wallexer.store.repo import has_live_history
 
 OK, WARN, FAIL, SKIP = "[green]✓[/]", "[yellow]⚠[/]", "[red]✗[/]", "[dim]–[/]"
 NET_ERRORS = (ApiError, TransportError)
@@ -153,8 +155,11 @@ async def run(
         rows.append(Row("not_allowed list", OK, f"{len(forbidden)} forbidden markets"))
     except FileNotFoundError as e:
         rows.append(Row("not_allowed list", FAIL, str(e)))
+    first_start = True
     try:
-        init_db(cfg.path(cfg.store.db_path)).close()
+        conn = init_db(cfg.path(cfg.store.db_path))
+        first_start = not has_live_history(conn)
+        conn.close()
         rows.append(Row("SQLite (WAL)", OK, cfg.store.db_path))
     except Exception as e:
         rows.append(Row("SQLite (WAL)", FAIL, str(e)[:90]))
@@ -210,12 +215,13 @@ async def run(
             private = False
         if private:
             try:
-                credit = await check_trading_credit(client, settings)
+                credit = await check_trading_credit(client, settings, first_start=first_start)
                 rows.append(Row("balances (sub-account header)", OK, "authenticated"))
                 held = ", ".join(f"{a} {human(v)}" for a, v in credit.assets_tmn.items()) or "none"
+                label = "TMN ≈ 5M (first start)" if first_start else "equity vs 5M (later start)"
                 rows.append(
                     Row(
-                        "trading credit ≈ 5M TMN",
+                        label,
                         OK if credit.ok else FAIL,
                         f"{credit.message}; coins: {held}"
                         + (f"; locked: {', '.join(credit.locked)}" if credit.locked else ""),
@@ -249,6 +255,28 @@ async def run(
                     rows.append(Row("fee table", OK if not fees.skipped else WARN, detail))
             except NET_ERRORS as e:
                 rows.append(Row("fee table", FAIL, str(e)[:100]))
+            try:
+                pkg = await fetch_package(client, settings)
+                save_unavailable(cfg.path(cfg.universe.unavailable_path), pkg)
+                rows.append(
+                    Row(
+                        "trading-credit package",
+                        OK,
+                        f"id {pkg.id} '{pkg.title}' {pkg.status}; loan {pkg.loan:,} {pkg.currency}; "
+                        f"warning_limit {pkg.warning_limit} / liquidity_limit {pkg.liquidity_limit} TMN",
+                    )
+                )
+                extra = sorted(pkg.unavailable - forbidden)
+                rows.append(
+                    Row(
+                        "unavailable markets",
+                        OK,
+                        f"{len(pkg.unavailable)} (saved to {cfg.universe.unavailable_path}); "
+                        f"beyond not_allowed: {', '.join(extra) or 'none'}",
+                    )
+                )
+            except (*NET_ERRORS, ConfigError) as e:
+                rows.append(Row("trading-credit package", FAIL, str(e)[:120]))
         else:
             for name in ("balances (sub-account header)", "trading credit ≈ 5M TMN", "fee table"):
                 rows.append(Row(name, SKIP, "needs API key + sub-account id"))

@@ -7,3 +7,5 @@ __pycache__/
 .env
 *.zip
 *.kate-swp
+data/engine_status.json
+data/engine.sock

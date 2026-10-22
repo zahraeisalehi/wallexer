@@ -83,6 +83,135 @@ def doctor(
         raise typer.Exit(1)
 
 
+engine_app = typer.Typer(help="Engine daemon (long-running).", no_args_is_help=True)
+app.add_typer(engine_app, name="engine")
+
+
+@engine_app.command("run")
+@friendly
+def engine_run(
+    mode: str = typer.Option("shadow", "--mode", help="shadow | trade"),
+    market: list[str] = typer.Option(
+        None, "--market", help="Restrict to these markets (repeatable)."
+    ),
+) -> None:
+    """Run the engine in the foreground (JSON logs to stdout). Used by hosting and by shadowtest/trade."""
+    from wallexer.config import ConfigError, Mode
+    from wallexer.engine.daemon import Engine
+    from wallexer.logging import setup_logging
+
+    try:
+        m = Mode(mode)
+    except ValueError:
+        raise ConfigError(f"unknown mode {mode!r}: use shadow or trade") from None
+    setup_logging(level=20, json=True)
+    asyncio.run(Engine(load_settings(), m, market or None).run())
+
+
+@app.command()
+@friendly
+def shadowtest(
+    markets: list[str] = typer.Argument(None, help="Markets (default: whole universe)."),
+) -> None:
+    """Start shadow mode (live data, simulated orders) as a detached engine."""
+    from wallexer.cli.engine_cmds import engine_running, spawn, wait_ready
+    from wallexer.config import Mode
+
+    settings = load_settings()
+    if engine_running(settings):
+        console.print(
+            "[yellow]Engine already running.[/] Use `wallexer status`, or `wallexer stop` first."
+        )
+        raise typer.Exit(1)
+    pid = spawn(settings, Mode.shadow, [m.upper() for m in markets or []])
+    if wait_ready(settings, console):
+        console.print(
+            f"[green]Shadow engine running[/] (pid {pid}). `wallexer status` to watch, `wallexer stop` to stop."
+        )
+    else:
+        console.print(f"[red]Engine did not come up.[/] See {settings.cfg.engine.log_path}.")
+        raise typer.Exit(1)
+
+
+@app.command()
+@friendly
+def trade(
+    markets: list[str] = typer.Argument(None, help="Markets (default: whole universe)."),
+) -> None:
+    """Start LIVE trading (real orders) after the human-in-the-loop prompt and confirmation."""
+    from wallexer.cli.engine_cmds import engine_running, human_in_the_loop, spawn, wait_ready
+    from wallexer.config import Mode
+
+    settings = load_settings()
+    if engine_running(settings):
+        console.print("[yellow]An engine is already running.[/] Stop it first (`wallexer stop`).")
+        raise typer.Exit(1)
+    if not human_in_the_loop(settings, console):
+        console.print("OK: review first. Run `wallexer shadowtest` and `wallexer status`.")
+        raise typer.Exit(0)
+    confirm = console.input("[bold red]This places REAL orders.[/] Type TRADE to start: ").strip()
+    if confirm != "TRADE":
+        console.print("Not confirmed. Nothing started.")
+        raise typer.Exit(1)
+    pid = spawn(settings, Mode.trade, [m.upper() for m in markets or []])
+    if wait_ready(settings, console):
+        console.print(f"[bold red]LIVE engine running[/] (pid {pid}).")
+    else:
+        console.print(f"[red]Engine did not come up.[/] See {settings.cfg.engine.log_path}.")
+        raise typer.Exit(1)
+
+
+@app.command()
+@friendly
+def status() -> None:
+    """Engine status: mode, equity, drawdown, strategies (backtest + shadow), feed health."""
+    from wallexer.cli.engine_cmds import NOT_RUNNING, get_status, render_status
+
+    st, live = get_status(load_settings())
+    if st is None:
+        console.print(NOT_RUNNING)
+        raise typer.Exit(1)
+    render_status(st, live, console)
+
+
+@app.command()
+@friendly
+def stop(
+    markets: list[str] = typer.Argument(None, help="Markets to stop (default: everything)."),
+) -> None:
+    """Stop all trading (engine exits) or only the given markets (their open orders are cancelled)."""
+    from wallexer.cli.engine_cmds import NOT_RUNNING, sock
+    from wallexer.engine import control
+
+    try:
+        resp = control.send(
+            sock(load_settings()), "stop", markets=[m.upper() for m in markets or []]
+        )
+    except control.EngineNotRunning:
+        console.print(NOT_RUNNING)
+        raise typer.Exit(1) from None
+    console.print(resp)
+
+
+@app.command()
+@friendly
+def flatten(
+    markets: list[str] = typer.Argument(None, help="Markets to flatten (default: all balances)."),
+) -> None:
+    """Sell every non-TMN balance (incl. USDT) to TMN, or only the given markets' coins."""
+    from wallexer.cli.engine_cmds import NOT_RUNNING, sock
+    from wallexer.engine import control
+
+    try:
+        resp = control.send(
+            sock(load_settings()), "flatten", markets=[m.upper() for m in markets or []]
+        )
+    except control.EngineNotRunning:
+        console.print(NOT_RUNNING)
+        raise typer.Exit(1) from None
+    console.print(resp)
+
+
 def main() -> None:
     setup_logging()
     app()

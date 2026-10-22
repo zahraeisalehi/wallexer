@@ -11,8 +11,9 @@ backoff_base_s = 0.5
 
 [ratelimit.market]
 # The exchange reports x-ratelimit-limit/remaining but not the window length.
-# `wallexer doctor` measures it; until then assume 60 s.
-window_s = 60.0
+# Confirmed by the user: 600 requests per 39 s window.
+window_s = 39.0
+limit = 600
 backoff_below_frac = 0.10
 
 [ratelimit.orders]
@@ -29,11 +30,10 @@ expected_equity_tmn = "5000000"
 equity_tolerance_pct = "10"
 
 [orders]
-# PLACEHOLDER: the spot minimum is not documented. Live trading is allowed with it, doctor warns.
-# When the exchange rejects a too-small order, the real minimum is parsed and written to
-# data/overrides.toml with verified = true.
+# Confirmed by the user: 100,000 TMN (USDT markets: TMN equivalent via USDTTMN).
+# Safety net: a too-small rejection still updates data/overrides.toml.
 min_order_value_tmn = "100000"
-min_order_verified = false
+min_order_verified = true
 # New positions must be at least this multiple of the minimum, so a position that loses value
 # can still be sold in full (positions are never left below the minimum).
 min_entry_multiple = "2.0"
@@ -43,6 +43,8 @@ min_entry_multiple = "2.0"
 exit_limit_slippage_pct = "0.5"
 exit_reprice_after_s = 10
 exit_max_reprices = 5
+# A remainder worth less than this after a full sell is accepted as dust (logged, exported).
+dust_cap_tmn = "1000"
 
 [fees]
 # Fallback rates when /v1/account/fee has no usable entry for a market. Set to the highest
@@ -53,6 +55,11 @@ default_taker = "0.003"
 
 [universe]
 top_n = 30
+# Default universe = markets with MARKET orders enabled (7 on 2026-10-22). LIMIT-only markets
+# are opt-in and get half the max position.
+include_limit_only = false
+max_markets = 12
+unavailable_path = "data/unavailable_markets.txt"
 min_quote_volume_tmn = "500000000"
 max_spread_bps = "100"
 quote_assets = ["TMN", "USDT"]
@@ -78,6 +85,61 @@ loss_cooldown_min = 60
 max_open_orders = 10
 flatten_no_entry_min = 90
 flatten_force_min = 30
+
+[engine]
+depth_interval_s = 3.0
+trades_interval_s = 10.0
+candles_interval_s = 60.0
+allocator_interval_s = 60.0
+reconcile_interval_s = 30.0
+feed_budget_frac = 0.7
+stale_after_intervals = 3.0
+frozen_book_s = 60.0
+socket_path = "data/engine.sock"
+health_port = 8000
+log_path = "data/logs/engine.log"
+# Days of 1-min candles replayed at startup to seed backtest paper stats.
+replay_days = 3
+
+[paper]
+capital_tmn = "5000000"
+slippage_bps = "2"
+maker_timeout_s = 60.0
+position_frac = "0.2"
+
+[strategies.basis_tmn_usdt]
+edge_margin_bps = "5"
+
+[strategies.mean_reversion]
+edge_margin_bps = "10"
+vwap_bars = 60
+z_entry = 2.0
+time_stop_min = 120
+
+[strategies.momentum]
+edge_margin_bps = "10"
+breakout_bars = 30
+vol_ratio_min = 1.5
+imbalance_min = 0.1
+atr_target_mult = 2.0
+time_stop_min = 240
+
+[promotion]
+# Live weight only if BOTH: the backtest replay passes (>= trades, net > 0, PF > min) AND
+# shadow paper trades are not net-negative (>= min_shadow_trades).
+min_backtest_trades = 10
+min_profit_factor = "1.2"
+min_shadow_trades = 3
+demote_window_trades = 10
+paper_only = ["basis_tmn_usdt"]
+
+[alloc]
+tau = 1.0
+max_strategy_weight = "0.6"
+score_window_trades = 30
+usdt_rebalance_band_pct = "5"
+usdt_min_hold_min = 60
+usdt_breakeven_trades_per_cycle = "2"
 
 [store]
 db_path = "data/wallexer.db"
