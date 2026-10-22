@@ -12,6 +12,10 @@ from wallexer.exchange.errors import ApiError, TransportError
 from wallexer.exchange.universe import UniverseEntry, build_universe
 
 
+def _bps(v) -> str:
+    return "–" if v is None else f"{v:.1f}"
+
+
 def _tier(e: UniverseEntry) -> str:
     # "*" (yellow) = config-default fee: no exchange data for this market.
     return f"[yellow]{e.fee_tier}[/]" if e.fee.source == "default" else e.fee_tier
@@ -46,11 +50,13 @@ async def run(settings: Settings, console: Console, *, show_all: bool = False) -
     t.add_column("Spread bps", justify="right")
     t.add_column("Fee tier M/T %", justify="right")
     t.add_column("Round-trip bps", justify="right")
+    t.add_column("RT incl. USDT conv", justify="right")
     t.add_column("Score", justify="right")
     t.add_column("Zero fee", justify="center")
     t.add_column("MARKET ord", justify="center")
     for i, e in enumerate(rows, 1):
         sp, rt = e.spread_bps, e.round_trip_bps
+        rt_conv = uni.round_trip_incl_conversion_bps(e)
         t.add_row(
             str(i),
             e.market.symbol,
@@ -59,6 +65,7 @@ async def run(settings: Settings, console: Console, *, show_all: bool = False) -
             "–" if sp is None else f"{sp:.1f}",
             _tier(e),
             "–" if rt is None else f"{rt:.1f}",
+            "" if rt_conv is None else f"[dim]{rt_conv:.1f}[/]",
             human(e.score) if rt is not None else "–",
             yes_no(e.market.is_zero_fee),
             # Red "no": MARKET disabled → exits use aggressive LIMIT orders instead.
@@ -71,5 +78,7 @@ async def run(settings: Settings, console: Console, *, show_all: bool = False) -
         + ", ".join(f"{k}={v}" for k, v in ex.items())
         + f"\ndepth: {uni.depth_source} · {fee_note} · USDT/TMN ≈ {human(uni.usdt_tmn)}"
         + "\nRound-trip = 2 × taker fee + spread (bps). Rank/score = 24h volume (TMN) / round-trip bps."
+        + "\nRT incl. USDT conv (USDT markets) = round-trip + one TMN→USDT→TMN cycle via USDTTMN"
+        + f" ({_bps(uni.usdt_conversion_bps)} bps): worst case, one trade per cycle; not used for ranking."
         + "\nMARKET ord = no → MARKET orders disabled on that market; exits use aggressive LIMIT.[/]"
     )
