@@ -75,7 +75,7 @@ It must return JSON matching this schema (validated with pydantic, temperature 0
 | max position per market | 20% of equity |
 | max total exposure (non-TMN) | 60% of equity |
 | max order value | 10% of equity |
-| min order value | exchange minimum + margin |
+| min order value | config (placeholder 100,000 TMN, learned from exchange rejection); entries ≥ 2× min; exits close in full |
 | stop-loss per position | min(2 × ATR, 2%) |
 | take-profit / trailing | strategy-defined, logged |
 | daily drawdown soft stop | 4% → risk_multiplier halved, no new entries for 30 min |
@@ -88,7 +88,7 @@ The risk gate can only reduce or reject orders, never enlarge them. It runs afte
 
 ## 4. Orders and state
 - All money math uses `Decimal`. Prices and amounts are rounded to each market's `price_precision` / `amount_precision`.
-- Prefer limit orders at/inside the spread; convert to aggressive only for stops and the final flatten.
+- Prefer limit orders at/inside the spread; convert to aggressive only for stops and the final flatten: MARKET where the market allows it, otherwise an aggressive LIMIT 0.5% past the best opposite price, re-priced while unfilled (see wallex-api.md).
 - The exchange is the source of truth: reconcile open orders and balances every cycle; never trust local state after a timeout.
 - Every order row carries `decision_id`; every decision row stores features, signal, weights, risk checks, and final action.
 

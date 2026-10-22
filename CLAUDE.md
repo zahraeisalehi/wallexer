@@ -68,4 +68,4 @@ Everything else is verified by running `shadowtest` against live data.
 - Work in small phases. Start each phase in plan mode; list files to create/change.
 - After each phase: run the relevant command, report what works, what is stubbed, and what is risky.
 - Prefer simple, readable code over clever abstractions. Comments explain *why*.
-- When done with a phase, print a short summary I can paste to my mentor: files changed, decisions made, open questions.
+- End each phase with a handoff report: files changed, decisions made, what's stubbed, risks, open questions.
