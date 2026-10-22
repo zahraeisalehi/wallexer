@@ -153,3 +153,84 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
         console.print(f"[dim]report: {path}[/]")
     finally:
         conn.close()
+
+
+async def run_basis_study(settings: Settings, console: Console) -> None:
+    """Research: executable triangle basis on stored simultaneous order-book snapshots."""
+    from wallexer.research.basis_study import BASES, load_cycles, pct, study
+
+    cfg = settings.cfg
+    conn = init_db(cfg.path(cfg.store.db_path))
+    try:
+        async with WallexClient(settings) as client:
+            fees = await client.fees()
+        symbols = ["USDTTMN"] + [f"{b}{q}" for b in BASES for q in ("TMN", "USDT")]
+        cycles, skew = load_cycles(conn, symbols)
+    finally:
+        conn.close()
+    if not cycles:
+        console.print(
+            "No complete snapshot cycles yet. Run `wallexer shadowtest` to collect books."
+        )
+        return
+    span_h = (
+        max(min(s.ts for s in c.values()) for c in cycles)
+        - min(min(s.ts for s in c.values()) for c in cycles)
+    ) / 3600
+    res = study(cycles, fees)
+    console.print(
+        f"[bold]Triangle basis study[/] · {len(cycles)} cycles over {span_h:.2f} h · "
+        f"max intra-cycle skew {skew:.2f}s · fees: TMN legs {fees.get('BTCTMN').taker * 100:.2f}% taker, "
+        f"USDT legs {fees.get('BTCUSDT').taker * 100:.2f}% taker"
+    )
+    t = Table(header_style="bold cyan", title="Net edge per cycle (bps of the TMN put in)")
+    for col in (
+        "Base",
+        "Dir",
+        "Taker p5/p50/p95/max",
+        "% >0",
+        "Mix best p50/max",
+        "Mix % >0",
+        "@200k p50/max",
+        "@200k % >0",
+        "Runs >0 @200k",
+        "Longest run",
+        "Max size >0 (TMN) p50/max",
+    ):
+        t.add_column(col, justify="right")
+    verdict_hits = 0
+    for st in res:
+        tk, mx = st.taker_bps, st.mix_bps
+        a2 = [v for v in st.at200k_bps if v is not None]
+        runs = st.runs()
+        repeatable = [r for r in runs if r[0] >= 2]
+        verdict_hits += len(repeatable)
+        sizes = [x for x in st.max_size if x > 0]
+        t.add_row(
+            st.base,
+            "A buy-TMN" if st.direction == "A" else "B sell-TMN",
+            f"{pct(tk, 0.05):.1f} / {pct(tk, 0.5):.1f} / {pct(tk, 0.95):.1f} / {max(tk):.1f}",
+            f"{sum(v > 0 for v in tk) / len(tk) * 100:.1f}%",
+            f"{pct(mx, 0.5):.1f} / {max(mx):.1f}",
+            f"{sum(v > 0 for v in mx) / len(mx) * 100:.1f}%",
+            f"{pct(a2, 0.5):.1f} / {max(a2):.1f}" if a2 else "no depth",
+            f"{sum(v > 0 for v in a2) / max(len(a2), 1) * 100:.1f}%",
+            str(len(runs)),
+            f"{max((r[0] for r in runs), default=0)} cyc / {max((r[1] for r in runs), default=0):.0f}s",
+            f"{pct(sizes, 0.5):,.0f} / {max(sizes):,.0f}" if sizes else "–",
+        )
+    console.print(t)
+    console.print(
+        "[dim]Taker = all 3 legs taker at executable top-of-book (spreads included). Mix = best single "
+        "maker leg (rests at its own best price, maker fee): an upper bound, the maker leg may never fill. "
+        "@200k = walking stored top-10 levels for 200,000 TMN. Runs = consecutive cycles (~3 s) with net "
+        "edge > 0 at 200k, all taker.[/]"
+    )
+    if verdict_hits:
+        console.print(
+            f"[green]Verdict: {verdict_hits} repeatable (>= 2 consecutive cycles) all-taker opportunities at 200k TMN.[/]"
+        )
+    else:
+        console.print(
+            "[red]Verdict: NO repeatable, positive, net-of-fee all-taker opportunity at >= 200,000 TMN in this sample.[/]"
+        )

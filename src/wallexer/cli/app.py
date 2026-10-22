@@ -243,6 +243,19 @@ def backtest(
     asyncio.run(run_walk_forward(load_settings(), console))
 
 
+research_app = typer.Typer(help="Research studies (read-only, no orders).", no_args_is_help=True)
+app.add_typer(research_app, name="research")
+
+
+@research_app.command("basis")
+@friendly
+def research_basis() -> None:
+    """Triangle basis (X/TMN vs X/USDT x USDT/TMN) on stored simultaneous order books."""
+    from wallexer.cli.backtest_cmds import run_basis_study
+
+    asyncio.run(run_basis_study(load_settings(), console))
+
+
 def main() -> None:
     setup_logging()
     app()
