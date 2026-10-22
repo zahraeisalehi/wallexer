@@ -31,6 +31,7 @@ from wallexer.exchange.errors import (
     OrderRejected,
     OrdersDisabled,
     OrderStatusUnknown,
+    ResponseShapeError,
     TransportError,
 )
 from wallexer.exchange.fees import FeeTable, parse_fee_table
@@ -46,6 +47,22 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 def _noop(kind: str, payload: dict[str, Any]) -> None:
     return None
+
+
+def _list(v: Any) -> list[Any]:
+    return [] if v is None else (v if isinstance(v, list) else [v])
+
+
+def _order(data: Any) -> Order:
+    """Every order-parsing path goes through here: tolerant model, raw JSON kept, and a shape
+    mismatch becomes a reported ResponseShapeError (with the raw body), never a bare crash."""
+    try:
+        o = Order.model_validate(data)
+    except ValidationError as e:
+        log.warning("order.unexpected_shape", error=str(e)[:300], raw=data)
+        raise ResponseShapeError("order", str(e)[:300], data) from e
+    o.raw = data if isinstance(data, dict) else None
+    return o
 
 
 def parse_json(text: str) -> Any:
@@ -121,9 +138,9 @@ class WallexClient:
             msg = body.get("message", "") if isinstance(body, dict) else str(body)
             code = body.get("code") if isinstance(body, dict) else None
             fields = body.get("result") if isinstance(body, dict) else None
-            raise ApiError(
-                resp.status_code, str(msg), code, fields if isinstance(fields, dict) else {}
-            )
+            # Keep `result` whatever its shape (dict of field -> [messages], list or string)
+            # and the whole body: the per-field reasons are the only way to diagnose a 422.
+            raise ApiError(resp.status_code, str(msg), code, fields, body)
         return body
 
     async def _send(
@@ -266,7 +283,7 @@ class WallexClient:
             if e.status == 404:
                 return None
             raise
-        return Order.model_validate(body["result"])
+        return _order(body["result"])
 
     async def place_order(
         self, spec: OrderSpec, *, quote_asset: str, usdt_tmn: Decimal | None = None
@@ -274,9 +291,8 @@ class WallexClient:
         """Submit once. Timeout → look up by client_id; never re-POST automatically."""
         self._check_latch()
         await self.order_limiter.acquire("create")
-        log.info(
-            "order.submit", client_id=spec.client_id, decision_id=spec.decision_id, **spec.to_body()
-        )
+        # The body goes in as ONE field: splatting it would repeat client_id and crash the call.
+        log.info("order.submit", decision_id=spec.decision_id, order=spec.to_body())
         try:
             resp = await self._send(
                 "POST",
@@ -295,9 +311,24 @@ class WallexClient:
                 min_order.handle_rejection(
                     self.settings, e, quote_asset, usdt_tmn, on_event=self.on_event
                 )
-                raise OrderRejected(e.status, e.message, e.code, e.fields) from e
+                log.warning(
+                    "order.rejected",
+                    client_id=spec.client_id,
+                    sent=spec.to_body(),
+                    error=e.detail(),
+                )
+                raise OrderRejected(e.status, e.message, e.code, e.fields, e.body) from e
             raise
-        return Order.model_validate(body["result"])
+        return await self._accepted(spec.client_id, body)
+
+    async def _accepted(self, client_id: str, body: Any) -> Order:
+        """A 2xx order response: the order exists. If its body can't be parsed, look the order
+        up by client_id instead (never treat it as a failure that could lead to a re-send)."""
+        try:
+            return _order(body.get("result") if isinstance(body, dict) else body)
+        except ResponseShapeError:
+            self.on_event("order.unparsed_response", {"client_id": client_id, "raw": body})
+            return await self._resolve_uncertain(client_id)
 
     async def _resolve_uncertain(self, client_id: str) -> Order:
         for delay in (1.0, 3.0):
@@ -316,7 +347,7 @@ class WallexClient:
         self._check_latch()
         await self.order_limiter.acquire("cancel")
         resp = await self._send("DELETE", f"/v1/account/orders/{client_id}", private=True)
-        return Order.model_validate(self._decode(resp)["result"])
+        return await self._accepted(client_id, self._decode(resp))
 
     async def cancel_order_body(self, client_id: str) -> Order:
         """DELETE /v1/account/orders with body {clientOrderId}. Counted by the order limiter."""
@@ -325,7 +356,7 @@ class WallexClient:
         resp = await self._send(
             "DELETE", "/v1/account/orders", body={"clientOrderId": client_id}, private=True
         )
-        return Order.model_validate(self._decode(resp)["result"])
+        return await self._accepted(client_id, self._decode(resp))
 
     async def open_orders(
         self, symbol: str | None = None, page: int | None = None, per_page: int | None = None
@@ -336,7 +367,7 @@ class WallexClient:
             private=True,
         )
         result = body.get("result") or {}
-        return {s: [Order.model_validate(o) for o in lst] for s, lst in result.items()}
+        return {s: [_order(o) for o in _list(lst)] for s, lst in result.items()}
 
     async def order_history(
         self,
@@ -365,4 +396,4 @@ class WallexClient:
             private=True,
         )
         result = body.get("result") or {}
-        return {s: [Order.model_validate(o) for o in lst] for s, lst in result.items()}
+        return {s: [_order(o) for o in _list(lst)] for s, lst in result.items()}

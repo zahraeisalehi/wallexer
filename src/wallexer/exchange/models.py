@@ -21,6 +21,19 @@ def _blank_to_none(v: Any) -> Any:
 OptDecimal = Annotated[Decimal | None, BeforeValidator(_blank_to_none)]
 
 
+def _as_list(v: Any) -> Any:
+    """Collections arrive as list, null, {} or (rarely) a dict of items: normalise to a list.
+
+    Seen live 2026-10-22: an order's `fills` was not a list while the order was open.
+    """
+    if v is None or v == "" or v == {}:
+        return []
+    if isinstance(v, dict):
+        vals = list(v.values())
+        return vals if all(isinstance(x, dict) for x in vals) else [v]
+    return v
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -63,8 +76,8 @@ class DepthLevel(_Model):
 
 
 class Book(_Model):
-    ask: list[DepthLevel] = []
-    bid: list[DepthLevel] = []
+    ask: Annotated[list[DepthLevel], BeforeValidator(_as_list)] = []
+    bid: Annotated[list[DepthLevel], BeforeValidator(_as_list)] = []
 
     @property
     def best_ask(self) -> Decimal | None:
@@ -139,7 +152,9 @@ class Order(_Model):
     # Status strings are undocumented; `active == False` is treated as terminal.
     active: bool | None = None
     fee: OptDecimal = None
-    fills: list[Fill] = []
+    fills: Annotated[list[Fill], BeforeValidator(_as_list)] = []
+    # The exact JSON the exchange returned for this order (set by the client; for logs/diagnosis).
+    raw: dict[str, Any] | None = Field(default=None, exclude=True)
 
     @property
     def remaining_qty(self) -> Decimal:

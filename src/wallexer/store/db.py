@@ -225,7 +225,9 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")  # CLI and engine share the file
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
+    )  # several processes (engine, CLI, research) share it  # CLI and engine share the file
     # WAL + NORMAL: no fsync per commit (only at checkpoints). A crash can lose the last few
     # commits but never corrupts the DB; FULL made per-row candle inserts take minutes.
     conn.execute("PRAGMA synchronous=NORMAL")

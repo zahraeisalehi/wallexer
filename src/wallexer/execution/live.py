@@ -8,6 +8,7 @@ cancel -> re-read executedQty -> re-place the remainder at a fresh aggressive pr
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Callable
@@ -17,7 +18,13 @@ import structlog
 
 from wallexer.config import Mode, Settings
 from wallexer.exchange.client import WallexClient
-from wallexer.exchange.errors import ApiError, OrderRejected, OrderStatusUnknown, TransportError
+from wallexer.exchange.errors import (
+    ApiError,
+    OrderRejected,
+    OrderStatusUnknown,
+    ResponseShapeError,
+    TransportError,
+)
 from wallexer.exchange.models import Book, OrderType, Trade
 from wallexer.exchange.rules import MarketRules, OrderRuleError, OrderSpec, reprice_exit
 from wallexer.execution.base import AccountSnapshot, ExecResult, OpenOrder
@@ -57,16 +64,28 @@ class LiveExecutor:
         try:
             order = await self.client.place_order(spec, quote_asset=quote, usdt_tmn=self.usdt_tmn())
         except OrderRejected as e:
-            repo.update_order(self.conn, spec.client_id, status="rejected", error=e.message[:300])
+            detail = e.detail()
+            repo.update_order(
+                self.conn,
+                spec.client_id,
+                status="rejected",
+                error=json.dumps(detail, ensure_ascii=False, default=str)[:2000],
+            )
+            log_event(
+                self.conn,
+                "order.rejected_detail",
+                {"client_id": spec.client_id, "sent": spec.to_body(), **detail},
+            )
             return ExecResult(spec.client_id, "rejected", error=e.message)
         except OrderStatusUnknown as e:
             repo.update_order(self.conn, spec.client_id, status="unknown", error=str(e))
             # Track it: reconcile will find it (or not) by client_id. Never re-send blindly.
             self.open_orders[spec.client_id] = OpenOrder(spec, time.time(), quote, is_exit=is_exit)
             return ExecResult(spec.client_id, "unknown", error=str(e))
-        except (ApiError, TransportError) as e:
+        except (ApiError, TransportError, ResponseShapeError) as e:
             repo.update_order(self.conn, spec.client_id, status="error", error=str(e)[:300])
             return ExecResult(spec.client_id, "rejected", error=str(e))
+        log_event(self.conn, "order.placed", {"client_id": spec.client_id, "raw": order.raw})
         status = (
             "filled"
             if order.active is False and order.executed_qty >= spec.quantity
@@ -89,7 +108,7 @@ class LiveExecutor:
     async def cancel(self, client_id: str) -> None:
         try:
             await self.client.cancel_order(client_id)
-        except (ApiError, TransportError) as e:
+        except (ApiError, TransportError, ResponseShapeError) as e:
             log.warning("live.cancel_failed", client_id=client_id, error=str(e)[:120])
         o = await self.client.get_order(client_id)
         if o is not None:
@@ -108,7 +127,7 @@ class LiveExecutor:
         for cid, o in list(self.open_orders.items()):
             try:
                 order = await self.client.get_order(cid)
-            except (ApiError, TransportError):
+            except (ApiError, TransportError, ResponseShapeError):
                 continue
             if order is None:
                 continue
@@ -196,7 +215,7 @@ class LiveExecutor:
         """Exchange truth: adopt our wx- orders we don't track (e.g. after a restart)."""
         try:
             remote = await self.client.open_orders()
-        except (ApiError, TransportError):
+        except (ApiError, TransportError, ResponseShapeError):
             return
         for sym_orders in remote.values():
             for o in sym_orders:

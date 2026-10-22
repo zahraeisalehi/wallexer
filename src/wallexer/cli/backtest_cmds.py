@@ -125,10 +125,21 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
         quotes = {s: markets[s].quote_asset for s in symbols}
         since = int(datetime.now(UTC).timestamp()) - cfg.backtest.history_days * 86400
         res_of = {1: "1", 5: "5", 15: "15", 60: "60"}
-        bars_by_tf = {
-            tf: {s: load_bars(conn, s, res_of[tf], since) for s in symbols}
-            for tf in cfg.backtest.timeframes
-        }
+
+        # Bars are loaded per timeframe inside the run (memory-bounded for the 1 GB server).
+        def load_tf(tf: int) -> dict[str, list]:
+            return {s: load_bars(conn, s, res_of[tf], since) for s in symbols}
+
+        firsts, lasts = [], []
+        for s in symbols:
+            lo, hi = conn.execute(
+                "SELECT MIN(ts), MAX(ts) FROM candles WHERE symbol=? AND resolution='1' AND ts >= ?",
+                (s, since),
+            ).fetchone()
+            if lo is not None:
+                firsts.append(lo)
+                lasts.append(hi)
+        span = (max(firsts), min(lasts))
         console.print(
             f"Grid: mean_reversion {cfg.backtest.grid_mean_reversion} + momentum {cfg.backtest.grid_momentum} "
             f"× timeframes {cfg.backtest.timeframes} = [bold]{len(walkforward.grid_configs(settings))} configs[/]"
@@ -137,7 +148,8 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
             task = prog.add_task("walk-forward", total=len(walkforward.grid_configs(settings)))
             wf = walkforward.run(
                 settings,
-                bars_by_tf,
+                load_tf,
+                span,
                 quotes,
                 rules,
                 fees,

@@ -167,6 +167,8 @@ min_is_trades = 10
 # warn_run_age_h. An already-promoted strategy is never demoted just because the run aged.
 max_run_age_h = 36
 warn_run_age_h = 20
+# The engine re-runs the walk-forward in a low-priority subprocess this often (0 = never).
+rerun_every_h = 12
 
 [backtest.grid_mean_reversion]
 z_entry = [1.5, 2.0, 2.5]

@@ -36,7 +36,7 @@ Full schemas: `docs/ref/wallex-spot-trading.json` (orders, depth/all) and `docs/
 | GET | `/v1/account/orders/{client_id}` | single order status |
 | DELETE | `/v1/account/orders/{client_id}` | cancel by client id |
 | DELETE | `/v1/account/orders` | cancel, body `{clientOrderId}` |
-| GET | `/v1/account/openOrders?symbol=&page=&per_page=` | active orders; `result` is an object keyed by symbol → list of orders |
+| GET | `/v1/account/openOrders?symbol=&page=&per_page=` | active orders; swagger says `result` is keyed by symbol, **observed 2026-10-22: `result = {"orders": [...]}`** (our parser accepts both) |
 | GET | `/v1/account/orders?market=&type=&side=&page=&per_page=&from=&to=` | order history, dates `YYYY-MM-DD`, max 100 per page |
 
 Order resource fields: `clientOrderId, symbol, type, side, price, origQty, executedQty, executedPrice, executedSum, executedPercent, status, active, fee, fills[], stopPrice, transactTime, created_at, updated_at`.
@@ -95,3 +95,19 @@ We trade **only** with the trading-credit (sub) account (spot only; no margin/fu
 ## Wallex MCP
 `https://api.wallex.ir/mcp` (Streamable HTTP). Public tools need no key; private tools need `X-API-Key`.
 Used by: Claude Code during development (public/read-only), and the LLM agent at runtime as read-only market tools. **Never place orders through MCP.**
+
+## Price band (observed, undocumented)
+`/hector/web/v1/markets` → `fair_price: {ask, bid, spot: {threshold, max_acceptable_buy, max_acceptable_sell}, ...}`
+(BTCTMN/ETHTMN 4 / 8 / 8, USDTTMN 3 / 4 / 4). A LIMIT BUY 20% below the best bid on BTCTMN was rejected
+with "اطلاعات وارد شده اشتباه است" (2026-10-22). Working assumption: limit prices must lie within these
+percentages of the fair price. Our exit LIMITs (0.5% through the book) are well inside it.
+
+## Sub-account header: reads vs orders (verified 2026-10-22)
+With the MAIN account's key, `GET /v1/account/balances` returns the trading-credit balance (5,000,000 TMN)
+when `sub-account-client-id` is sent, and 0 TMN without it. But `POST /v1/account/orders` with the same key
+and header executed against the main account: 422, error_code 1006, `quantity`: "موجودی شما کافی نیست.
+موجودی شما 0 تومان می باشد." So the header switches reads, not order placement. Our client sends the header
+on every private request (regression test `test_every_private_request_carries_the_subaccount_header`).
+Fix: use an API key created INSIDE the trading-credit account (as required above). Note: the swagger
+defines `requests.CreateSubAccountOrderRequest` / `CancelSubAccountOrderRequest` with a body field
+`subAccount_client_id`, but no path for them is documented, so we don't use them.
