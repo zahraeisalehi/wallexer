@@ -32,6 +32,16 @@ DEV = (ROOT / "config" / "default.toml").exists()
 DEFAULT_CONFIG = ROOT / "config" / "default.toml" if DEV else _RESOURCES / "default.toml"
 
 
+DEMO_REFUSED = ("trade", "stop", "flatten", "change", "resume")
+
+
+def is_demo() -> bool:
+    """WALLEXER_DEMO=1: a public demo server. Read from the process env only (set on the host),
+    so no config file or .env can switch it off. Demo = shadow only, the order latch can never
+    open, and the trading commands are refused."""
+    return os.environ.get("WALLEXER_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _home_override() -> Path | None:
     h = os.environ.get("WALLEXER_HOME")
     return Path(h).expanduser() if h else None
@@ -400,6 +410,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
     raw = _read_toml(config_path or DEFAULT_CONFIG)
     if not DEV or _home_override() is not None:
         raw = _deep_merge(raw, _read_toml(user_config_path()))
+    if is_demo():  # slower polling so the demo leaves the Wallex rate limit alone
+        raw = _deep_merge(raw, _read_toml(DEFAULT_CONFIG.with_name("demo.toml")))
     try:
         base = AppConfig.model_validate(raw)
         overrides = _read_toml(base.path(base.store.overrides_path))

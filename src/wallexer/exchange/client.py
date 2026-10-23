@@ -24,7 +24,7 @@ import httpx
 import structlog
 from pydantic import ValidationError
 
-from wallexer.config import Settings
+from wallexer.config import Settings, is_demo
 from wallexer.exchange import min_order
 from wallexer.exchange.errors import (
     ApiError,
@@ -83,7 +83,7 @@ class WallexClient:
         ex = settings.cfg.exchange
         rl = settings.cfg.ratelimit
         self.on_event = on_event
-        self._orders_enabled = orders_enabled
+        self._orders_enabled = orders_enabled and not is_demo()
         self.market_limiter = MarketDataLimiter(rl.market.window_s, rl.market.backoff_below_frac)
         self.order_limiter = OrderLimiter(
             rl.orders.max_requests, rl.orders.window_s, rl.orders.backlog_warn, on_event=on_event
@@ -268,10 +268,14 @@ class WallexClient:
     # ------------------------------------------------------------------ orders (private)
 
     def enable_orders(self) -> None:
-        """Only the live executor (trade mode) may call this."""
+        """Only the live executor (trade mode) may call this. Never on a demo server."""
+        if is_demo():
+            raise OrdersDisabled("demo server (WALLEXER_DEMO=1): orders can never be enabled")
         self._orders_enabled = True
 
     def _check_latch(self) -> None:
+        if is_demo():  # checked again per request: the flag alone is not trusted
+            raise OrdersDisabled("demo server (WALLEXER_DEMO=1): order requests are disabled")
         if not self._orders_enabled:
             raise OrdersDisabled("order requests are disabled (not in live trade mode)")
 

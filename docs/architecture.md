@@ -31,7 +31,8 @@ Each strategy implements:
 ```python
 class Strategy(Protocol):
     name: str
-    def on_tick(self, features: Features) -> list[Signal]: ...   # pure, deterministic
+
+    def on_tick(self, features: Features) -> list[Signal]: ...  # pure, deterministic
 ```
 `Signal` = market, side, strength in [-1, 1], suggested stop, reason (dict of the numbers that triggered it).
 

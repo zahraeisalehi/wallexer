@@ -21,7 +21,7 @@ import typer
 from wallexer.cli import source
 from wallexer.cli.help import PANEL
 from wallexer.cli.theme import make_console
-from wallexer.config import ConfigError, load_settings
+from wallexer.config import DEMO_REFUSED, ConfigError, is_demo, load_settings
 from wallexer.exchange.account import PreflightError
 from wallexer.exchange.errors import WallexError
 from wallexer.logging import setup_logging
@@ -118,6 +118,12 @@ def root(
                 run_setup(console)
         run_repl(app, console)
         return
+    if cmd in DEMO_REFUSED and is_demo():
+        _err(
+            f"`{cmd}` is refused on this demo server (WALLEXER_DEMO=1): it runs shadow only",
+            "status, watch, log, reason, rslt and sum work here",
+        )
+        raise typer.Exit(2)
     if cmd in source.WRITE_COMMANDS:
         try:
             on = source.FORCED_REMOTE["on"] or load_settings().cfg.remote.default

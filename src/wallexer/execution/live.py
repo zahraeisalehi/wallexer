@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import structlog
 
-from wallexer.config import Mode, Settings
+from wallexer.config import Mode, Settings, is_demo
 from wallexer.exchange.client import WallexClient
 from wallexer.exchange.errors import (
     ApiError,
@@ -50,6 +50,8 @@ class LiveExecutor:
     ) -> None:
         if mode is not Mode.trade:
             raise RuntimeError("LiveExecutor may only be created in trade mode")
+        if is_demo():
+            raise RuntimeError("LiveExecutor refused: demo server (WALLEXER_DEMO=1)")
         self.settings = settings
         self.client = client
         self.conn = conn

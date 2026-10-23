@@ -6,6 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:$PATH" \
     WALLEXER_IN_CONTAINER=1
+# Demo image only (deploy/deploy-demo.sh passes --build-arg WALLEXER_DEMO=1): shadow only, the
+# order latch can never open. Empty for the live app.
+ARG WALLEXER_DEMO=""
+ENV WALLEXER_DEMO=${WALLEXER_DEMO}
 
 RUN pip install --no-cache-dir uv
 

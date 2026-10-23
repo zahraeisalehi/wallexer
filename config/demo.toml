@@ -1,0 +1,22 @@
+# Layered on top of default.toml only when WALLEXER_DEMO=1 (the wallexer-demo app on Liara).
+# The demo shows the engine in shadow mode; it polls slowly so it leaves most of the Wallex
+# rate limit to the live app. Strategy, risk and allocation settings are not changed here.
+
+[engine]
+depth_interval_s = 15.0
+trades_interval_s = 60.0
+candles_interval_s = 180.0
+allocator_interval_s = 120.0
+reconcile_interval_s = 120.0
+# At most 15% of the market-data limit for the planned feed calls.
+feed_budget_frac = 0.15
+# Matches the slower depth polling (3 missed polls = stale, as in the default).
+stale_after_intervals = 3.0
+frozen_book_s = 180.0
+
+[universe]
+max_markets = 6
+
+[backtest]
+# A smaller first history sync on the fresh demo disk.
+history_days = 10
