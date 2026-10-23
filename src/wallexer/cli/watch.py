@@ -1,8 +1,10 @@
 """`wallexer watch`: live Textual view of the engine (read-only).
 
-- Numbers panel (equity, PnL, drawdown, exposure, positions, weights, agent stance) is updated in
-  place every 2 s, never printed twice.
-- Log panel appends new decisions and events as they happen.
+- Numbers panel (equity, PnL, drawdown, exposure, agent stance) is updated in place every 2 s,
+  never printed twice.
+- Log panel: the last WATCH_ROWS decisions, orders and risk/schedule/control events as one-line
+  summaries (no raw JSON; feed/system events such as book_stale or demo.summary are left out:
+  `log` has them all).
 - Shadow and trade use clearly different themes (yellow "SHADOW" banner vs red "LIVE TRADE").
 - The Quit button and `q` close the view only; the engine keeps running (use `wallexer stop`).
 - Local mode reads the engine socket + DB; remote mode (`--remote`) reads the server's read-only
@@ -14,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Footer, RichLog, Static
@@ -26,6 +29,34 @@ from wallexer.store.db import connect
 
 REFRESH_S = 2.0
 REMOTE_REFRESH_S = 5.0
+WATCH_ROWS = 5
+# Event kinds the live view shows (trades, risk, schedule, human controls); the rest is noise here.
+WATCH_EVENTS = ("order.", "risk.", "flatten.", "schedule.", "control.")
+
+
+def watch_lines(decisions: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[str]:
+    """One markup line per decision / relevant event, oldest first."""
+    from rich.markup import escape
+
+    from wallexer.cli.views import one_line, payload_summary
+
+    rows = [(r["ts"], "d", r) for r in decisions] + [
+        (r["ts"], "e", r) for r in events if r["kind"].startswith(WATCH_EVENTS)
+    ]
+    out = []
+    for ts, kind, r in sorted(rows, key=lambda x: x[0]):
+        if kind == "d":
+            what = f"{r['symbol']} · " if r.get("symbol") else ""
+            out.append(
+                f"[bold cyan]{ts[11:19]} #{r['id']} {r['action']}[/] "
+                f"{escape(one_line(what + (r['reason'] or ''), 46))}"
+            )
+        else:
+            color = "red" if r["kind"].startswith("risk.") else "yellow"
+            out.append(
+                f"[{color}]{ts[11:19]} {r['kind']}[/] {escape(payload_summary(r['payload'], 46))}"
+            )
+    return out
 
 
 class LocalFeed:
@@ -34,9 +65,12 @@ class LocalFeed:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.conn: sqlite3.Connection = connect(settings.cfg.path(settings.cfg.store.db_path))
-        self.last_decision = self.conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM decisions"
-        ).fetchone()[0]
+        # start with the last few decisions, then append new ones
+        self.last_decision = max(
+            0,
+            self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM decisions").fetchone()[0]
+            - WATCH_ROWS,
+        )
         self.last_event = max(
             0, self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0] - 20
         )
@@ -87,10 +121,10 @@ class RemoteFeed:
 
     def decisions(self) -> list[dict[str, Any]]:
         try:
-            if self.last_decision is None:  # start from the newest, like the local view
+            if self.last_decision is None:  # start with the last few, like the local view
                 ov = source.api_get(self.r, "/api/reason", timeout=5) or {}
-                self.last_decision = max((d["id"] for d in ov.get("decisions") or []), default=0)
-                return []
+                newest = max((d["id"] for d in ov.get("decisions") or []), default=0)
+                self.last_decision = max(0, newest - WATCH_ROWS)
             rows = (
                 source.api_get(self.r, "/api/reason", {"after": self.last_decision}, timeout=5)
                 or {}
@@ -124,29 +158,22 @@ class RemoteFeed:
 
 
 def _numbers(st: dict[str, Any]) -> str:
+    """The key numbers only (everything else: `status --full`)."""
+    from wallexer.cli.views import one_line
+
     ag = st.get("agent") or {}
-    weights = ", ".join(
-        f"{s['name']} {s['weight']}" for s in st.get("strategies", []) if not s.get("watch")
+    agent = (
+        f"{ag.get('stance')} ×{ag.get('effective_risk_multiplier')} · {one_line(ag.get('rationale'), 50)}"
+        if ag.get("source")
+        else "no decision yet"
     )
-    lines = [
-        f"Equity     {tmn(st['equity_tmn']):>14} TMN    PnL vs 5M  {pct(st['pnl_pct_vs_start'], 3)}",
-        f"Drawdown   {pct(st['drawdown_pct'], 3, signed=False):>14}        Exposure   {tmn(st['exposure_tmn'])} TMN",
-        f"Positions  {', '.join(f'{k} {tmn(v)} TMN' for k, v in st['positions'].items()) or 'none'}",
-        f"Weights    {weights}",
-        f"Phase      {st['phase']} · hard stop {'ACTIVE' if st['hard_stopped'] else 'off'} · "
-        f"soft stop {'active' if st['soft_stop_active'] else 'off'} · open orders {st.get('open_orders')}",
-        f"Agent      {ag.get('stance')} ({ag.get('source')}, {ag.get('age_min')} min ago) · "
-        f"risk × {ag.get('effective_risk_multiplier')}",
-        f"Rationale  {(ag.get('rationale') or '')[:160]}",
-    ]
-    if st.get("flat_by_design"):
-        lines.append("flat by design: no strategy has proven edge yet")
-    feed = st.get("feed") or {}
-    lines.append(
-        "Books      "
-        + "  ".join(f"{k} {v['spread_bps']}bps{'!' if v['issue'] else ''}" for k, v in feed.items())
+    return "\n".join(
+        [
+            f"Equity    {tmn(st['equity_tmn']):>14} TMN    PnL       {pct(st['pnl_pct_vs_start'], 3)}",
+            f"Drawdown  {pct(st['drawdown_pct'], 3, signed=False):>14}        Exposure  {tmn(st['exposure_tmn'])} TMN",
+            f"Agent     {agent}",
+        ]
     )
-    return "\n".join(lines)
 
 
 class WatchApp(App):
@@ -173,7 +200,7 @@ class WatchApp(App):
         yield Static("connecting…", id="banner")
         with Vertical():
             yield Static("", id="numbers")
-            yield RichLog(id="log", wrap=True, markup=True)
+            yield RichLog(id="log", wrap=True, markup=True, max_lines=WATCH_ROWS)
         with Horizontal(id="bar"):
             yield Button("Quit view", id="quit", variant="error")
         yield Footer()
@@ -206,26 +233,13 @@ class WatchApp(App):
         self.screen.set_classes("trade" if mode == "trade" else "shadow")
         tag = "LIVE TRADE (real orders)" if mode == "trade" else "SHADOW (simulated orders)"
         banner.update(
-            f"{tag} · run {st.get('run_id')} · uptime {duration(st.get('uptime_s'))}{where}"
+            f"{tag} · uptime {duration(st.get('uptime_s'))}{where}"
             + ("" if live else " · stale (engine down)")
         )
-        self.query_one("#numbers", Static).update(_numbers(st))
+        self.query_one("#numbers", Static).update(Text(_numbers(st)))
         log = self.query_one("#log", RichLog)
-        for r in self.feed.decisions():
-            log.write(
-                f"[bold cyan]{r['ts'][11:19]} decision #{r['id']}[/] {r['action']} {r['symbol'] or ''} · "
-                f"{(r['reason'] or '')[:140]}"
-            )
-        for r in self.feed.events():
-            kind = r["kind"]
-            color = (
-                "red"
-                if kind.startswith("risk.")
-                else "yellow"
-                if kind.startswith("feed.")
-                else "dim"
-            )
-            log.write(f"[{color}]{r['ts'][11:19]} {kind}[/] {(r['payload'] or '')[:140]}")
+        for line in watch_lines(self.feed.decisions(), self.feed.events()):
+            log.write(line)
 
     def on_unmount(self) -> None:
         self.feed.close()

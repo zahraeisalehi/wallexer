@@ -84,7 +84,83 @@ def get_status(settings: Settings) -> tuple[dict[str, Any] | None, bool]:
     return None, False
 
 
-def render_status(st: dict[str, Any], live: bool, console: Console, origin: str = "LOCAL") -> None:
+def next_deadline(
+    sch: dict[str, Any] | None, now: float | None = None, short: bool = False
+) -> str | None:
+    """The next schedule boundary only: 'entries stop 18:50 UTC (in 5h33m)' ('entries stop in
+    5h33m' when short); None if no schedule."""
+    from datetime import UTC, datetime
+
+    if not sch or not sch.get("end"):
+        return None
+    now = time.time() if now is None else now
+    for label, key in (
+        ("entries stop", "entries_stop"),
+        ("flatten", "flatten_from"),
+        ("end", "end"),
+    ):
+        try:
+            ts = datetime.strptime(sch[key], "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        left = int(ts - now)
+        if left > 0:
+            h, rem = divmod(left, 3600)
+            m, sec = divmod(rem, 60)
+            dur = f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
+            return f"{label} in {dur}" if short else f"{label} {sch[key][11:]} (in {dur})"
+    return "event ended"
+
+
+def render_status_brief(st: dict[str, Any], live: bool, console: Console, origin: str) -> None:
+    """Default `status`: mode, equity, PnL, drawdown, positions, agent, next deadline."""
+    from wallexer.cli.views import one_line
+
+    badges = ("[demo] DEMO [/] " if st.get("demo") else "") + (
+        "[shadow] SHADOW [/]" if st.get("mode") == "shadow" else "[live] LIVE [/]"
+    )
+    stale = (
+        "" if live else f" · [warn]engine not running (status from {_ago(st.get('written_at'))})[/]"
+    )
+    pnl = st["pnl_pct_vs_start"]
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column(style="muted")
+    t.add_column(justify="right")
+    t.add_column(style="muted")
+    t.add_column(justify="right")
+    t.add_row(
+        "Equity",
+        f"{tmn(st['equity_tmn'])} TMN",
+        "PnL",
+        f"[{'err' if str(pnl).startswith('-') else 'ok'}]{pct(pnl, 3)}[/]",
+    )
+    t.add_row(
+        "Drawdown",
+        pct(st["drawdown_pct"], 3, signed=False),
+        "Positions",
+        ", ".join(f"{k} {tmn(v)}" for k, v in st["positions"].items()) or "none",
+    )
+    ag = st.get("agent") or {}
+    agent = (
+        f"[key]Agent[/] {ag.get('stance')} ×{ag.get('effective_risk_multiplier')} · "
+        f"{one_line(ag.get('rationale'), 60)}"
+        if ag.get("source")
+        else "[key]Agent[/] [muted]no decision yet[/]"
+    )
+    nxt = next_deadline(st.get("schedule"))
+    console.print(badges + stale)
+    console.print(t)
+    console.print(agent)
+    console.print(f"[key]Next[/] {nxt}" if nxt else "[warn]no schedule (EVENT_END_UTC not set)[/]")
+    console.print("[muted]`status --full`: strategies, markets, feed, run details[/]")
+
+
+def render_status(
+    st: dict[str, Any], live: bool, console: Console, origin: str = "LOCAL", full: bool = False
+) -> None:
+    if not full and not st.get("starting"):
+        render_status_brief(st, live, console, origin)
+        return
     if st.get("starting"):
         console.print(
             Panel(

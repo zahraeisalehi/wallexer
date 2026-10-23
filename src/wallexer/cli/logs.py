@@ -24,16 +24,16 @@ def _conn(settings: Settings) -> sqlite3.Connection:
 # Data comes from the local DB or, in remote mode, the server's read-only API (cli/source.py).
 
 
-def show_log(settings: Settings, console: Console, n: int | None) -> None:
-    views.render_log(source.log(settings, n), console, paged=console.is_interactive)
+def show_log(settings: Settings, console: Console, n: int | None, full: bool = False) -> None:
+    views.render_log(source.log(settings, n), console, paged=console.is_interactive, full=full)
 
 
-def show_reason(settings: Settings, console: Console, n: int | None) -> None:
+def show_reason(settings: Settings, console: Console, n: int | None, full: bool = False) -> None:
     d = source.reason(settings, n)
     if n is None:
-        views.render_reason_overview(d or {}, console)
+        views.render_reason_overview(d or {}, console, full)
     else:
-        views.render_reason(d, console)
+        views.render_reason(d, console, full)
 
 
 # ---------------------------------------------------------------------------------- exp-reason

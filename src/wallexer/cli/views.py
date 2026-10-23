@@ -13,8 +13,9 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.table import Table
 
 from wallexer.cli.theme import pct, table, tmn, verdict
 
@@ -24,6 +25,80 @@ def _j(s: str | None) -> Any:
         return json.loads(s) if s else None
     except ValueError:
         return s
+
+
+# ---------------------------------------------------------------------------------- compact
+# Default views show the key lines only; `--full` (or `details <command>`) shows everything.
+
+
+def one_line(text: str | None, n: int = 110) -> str:
+    """The first sentence (or the first n characters) of a free-text reason."""
+    t = " ".join((text or "").split())
+    for stop in (". ", "; "):
+        i = t.find(stop)
+        if 0 < i < n:
+            return t[: i + 1].rstrip(";") if stop == ". " else t[:i]
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+def _scalar(v: Any) -> str | None:
+    if isinstance(v, bool) or v is None:
+        return None if v is None else str(v).lower()
+    if isinstance(v, int | float | str):
+        sv = str(v)
+        return sv if len(sv) <= 24 else None
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return ",".join(v) if v and len(",".join(v)) <= 30 else (str(len(v)) if v else None)
+    return None
+
+
+def payload_summary(payload: Any, n: int = 70) -> str:
+    """'symbol=BTCTMN side=buy price=…' from an event payload (JSON text or dict), no raw JSON."""
+    d = _j(payload) if isinstance(payload, str) else payload
+    if not isinstance(d, dict):
+        return one_line(str(d or ""), n)
+    parts = [f"{k}={v}" for k, v in ((k, _scalar(v)) for k, v in d.items()) if v not in (None, "")]
+    out = " ".join(parts)
+    return out if len(out) <= n else out[: n - 1].rstrip() + "…"
+
+
+def key_numbers(p: dict[str, Any]) -> list[tuple[str, str]]:
+    """The 3-5 numbers that drove a decision (the full record: `reason <n> --full`)."""
+    sig = p.get("signal") or {}
+    rc = p.get("risk_checks") or {}
+    out: list[tuple[str, str]] = []
+    if p["action"] in ("agent_decision", "agent_fallback"):
+        d = sig.get("decision") or {}
+        before, after = rc.get("before") or {}, rc.get("after") or {}
+        out.append(("stance", str(d.get("stance") or sig.get("stance") or "fallback")))
+        if before or after:
+            out.append(
+                (
+                    "risk multiplier",
+                    f"{before.get('risk_multiplier', '–')} → {after.get('risk_multiplier', '–')}",
+                )
+            )
+        nonzero = {k: v for k, v in (d.get("strategy_weights") or {}).items() if v}
+        out.append(("weights", ", ".join(f"{k} {v}" for k, v in nonzero.items()) or "all 0"))
+        out.append(("paused", ", ".join(d.get("pause_markets") or []) or "none"))
+        out.append(("source", f"{sig.get('source', 'fallback')} · trigger {sig.get('trigger')}"))
+        return out
+    if p["action"] in ("promote", "demote"):
+        for seg in ("oos", "shadow"):
+            x = sig.get(seg) or {}
+            if x:
+                out.append(
+                    (seg.upper(), f"n {x.get('n')} · net {x.get('net_tmn')} · PF {x.get('pf')}")
+                )
+        return out
+    for src in (sig, p.get("features") or {}, rc):
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            sv = _scalar(v)
+            if sv is not None and len(out) < 5:
+                out.append((k.replace("_", " "), sv))
+    return out
 
 
 # ---------------------------------------------------------------------------------- log
@@ -43,7 +118,9 @@ def log_data(
     return {"total": total, "entries": [dict(r) for r in reversed(rows)]}
 
 
-def render_log(data: dict[str, Any], console: Console, paged: bool = True) -> None:
+def render_log(
+    data: dict[str, Any], console: Console, paged: bool = True, full: bool = False
+) -> None:
     if "entry" in data:
         e = data["entry"]
         if e is None:
@@ -62,9 +139,17 @@ def render_log(data: dict[str, Any], console: Console, paged: bool = True) -> No
         f"{len(entries)} of {data['total']}" if data["total"] > len(entries) else str(len(entries))
     )
     t = table(
-        f"Logs ({shown}) · `wallexer log <id>` shows one in full",
-        [("#", "num"), ("Time (UTC)", "text"), ("Kind", "text"), ("Payload", "text")],
+        f"Logs ({shown}) · `wallexer log <id>` shows one in full"
+        if full
+        else f"Logs ({shown}) · `log <id>` shows one in full · `log --full` shows payloads",
+        [("#", "num"), ("Time (UTC)" if full else "UTC", "text"), ("Kind", "text")]
+        + [("Payload" if full else "Summary", "text")],
     )
+    width = max(30, min(90, console.width - 46))  # one line per entry in the summary view
+    if not full:
+        for c in t.columns:
+            c.no_wrap = True
+        t.columns[-1].overflow = "ellipsis"
     for e in entries:
         kind = e["kind"]
         style = (
@@ -76,9 +161,9 @@ def render_log(data: dict[str, Any], console: Console, paged: bool = True) -> No
         )
         t.add_row(
             str(e["id"]),
-            e["ts"][:19],
+            e["ts"][:19] if full else e["ts"][11:19],
             f"[{style}]{kind}[/]" if style else kind,
-            (e["payload"] or "")[:110],
+            (e["payload"] or "")[:110] if full else payload_summary(e["payload"], width),
         )
     if paged:
         with console.pager(styles=True):
@@ -149,7 +234,25 @@ def reason_overview_data(conn: sqlite3.Connection, limit: int = 200) -> dict[str
     }
 
 
-def render_reason_overview(d: dict[str, Any], console: Console) -> None:
+def render_reason_overview(d: dict[str, Any], console: Console, full: bool = False) -> None:
+    if not full:
+        console.print(
+            f"[key]Decisions[/] {d['decisions_total']} · [key]orders[/] {d['orders_total']} "
+            f"(filled {d['orders_filled']}) · `reason <id>` for one · `reason --full` for all columns"
+        )
+        t = table(
+            None, [("#", "num"), ("Time (UTC)", "text"), ("Action", "text"), ("Summary", "text")]
+        )
+        t.columns[0].no_wrap = t.columns[1].no_wrap = t.columns[2].no_wrap = True
+        for x in d["decisions"][-15:]:
+            what = f"{x['symbol']} · " if x.get("symbol") else ""
+            t.add_row(str(x["id"]), x["ts"][11:19], x["action"], what + one_line(x["reason"], 90))
+        console.print(t)
+        if len(d["decisions"]) > 15:
+            console.print(
+                f"[muted]last 15 of {d['decisions_total']} · `reason --full` lists more[/]"
+            )
+        return
     console.print(f"[key]Decisions[/] {d['decisions_total']} · by action {d['by_action']}")
     console.print(
         f"[key]Orders[/] {d['orders_total']} · by mode {d['orders_by_mode'] or '{}'} · filled {d['orders_filled']}"
@@ -194,9 +297,46 @@ def render_reason_overview(d: dict[str, Any], console: Console) -> None:
         )
 
 
-def render_reason(p: dict[str, Any] | None, console: Console) -> None:
+def render_reason(p: dict[str, Any] | None, console: Console, full: bool = False) -> None:
     if p is None:
         console.print("[err]no such decision[/] · list them with `wallexer reason`")
+        return
+    if not full:
+        nums = Table(show_header=False, box=None, padding=(0, 2))
+        nums.add_column(style="muted", no_wrap=True)
+        nums.add_column()
+        for k, v in key_numbers(p):
+            nums.add_row(k, v)
+        orders = (
+            f"{len(p['orders'])} order(s): "
+            + ", ".join(f"{o['side']} {o['symbol']} {o['status']}" for o in p["orders"][:3])
+            if p["orders"]
+            else "no orders"
+        )
+        console.print(
+            Panel(
+                Group(
+                    " · ".join(
+                        x
+                        for x in (
+                            f"[key]#{p['decision_id']}[/] {p['action']}",
+                            p["symbol"],
+                            p["strategy"],
+                            f"{p['ts'][:16].replace('T', ' ')} UTC",
+                            orders,
+                        )
+                        if x
+                    ),
+                    f"\n{one_line(p['reason'], 240)}\n",
+                    nums,
+                ),
+                title="Decision",
+                subtitle="[muted]`reason "
+                + str(p["decision_id"])
+                + " --full` for every feature[/]",
+                expand=False,
+            )
+        )
         return
     console.print(
         Panel(
@@ -337,12 +477,45 @@ def _dd_lookup(dd: dict, key: tuple) -> Any:
     return None
 
 
-def render_rslt_backtest(d: dict[str, Any] | None, console: Console) -> None:
+def render_rslt_backtest(d: dict[str, Any] | None, console: Console, full: bool = False) -> None:
     if d is None:
         console.print("No backtest yet · run `wallexer backtest`.")
         return
     custom = d["kind"] != "walk_forward"
     label = "Custom backtest" if custom else "Walk-forward run"
+    if not full:
+        passed = [s["strategy"] for s in d["strategies"] if s["passes"]]
+        console.print(
+            f"[key]{label} #{d['run_id']}[/] · "
+            + (
+                f"[ok]promotable: {', '.join(passed)}[/]"
+                if passed
+                else "[warn]no strategy passes out-of-sample[/]"
+            )
+            + (" · [warn]custom: never used for promotion[/]" if custom else "")
+        )
+        t = table(
+            None,
+            [
+                ("Strategy", "text"),
+                ("OOS return", "num"),
+                ("Trades", "num"),
+                ("PF", "num"),
+                ("Verdict", "text"),
+            ],
+        )
+        for s in d["strategies"]:
+            x = s.get("oos") or {}
+            t.add_row(
+                s["strategy"],
+                pct(x["return_pct"], 3) if x else "–",
+                str(x["trades"]) if x else "–",
+                f"{x['pf']:.2f}" if x and x.get("pf") is not None else "–",
+                verdict(s["passes"], one_line(s["reason"], 50)),
+            )
+        console.print(t)
+        console.print("[muted]`rslt backtest --full`: in-sample rows, configs, pooled grid[/]")
+        return
     console.print(
         f"[key]{label} #{d['run_id']}[/] · history {d['history']} · split {d['split']} · "
         f"grid {d['grid_size']} configs · report {d['report']}"
@@ -503,9 +676,28 @@ def rslt_shadow_data(
     }
 
 
-def render_rslt_shadow(d: dict[str, Any] | None, console: Console) -> None:
+def render_rslt_shadow(d: dict[str, Any] | None, console: Console, full: bool = False) -> None:
     if d is None:
         console.print("No shadow run yet · start one with `wallexer shadowtest`.")
+        return
+    if not full:
+        trades = sum(b["trades"] for b in d["books"])
+        console.print(
+            f"[key]Shadow {d['run_id'].split('-', 1)[-1]}[/] · account {pct(d['account_return_pct'], 3)} · "
+            f"max DD {pct(d['account_max_dd_pct'], 3, signed=False)} · {trades} paper trade(s)"
+        )
+        t = table(
+            None, [("Book", "text"), ("Return", "num"), ("Trades", "num"), ("Win rate", "num")]
+        )
+        for b in d["books"]:
+            t.add_row(
+                b["book"],
+                pct(b["return_pct"], 3),
+                str(b["trades"]),
+                pct(b["win_rate"], 0, signed=False) if b["win_rate"] is not None else "–",
+            )
+        console.print(t)
+        console.print("[muted]`rslt shadowtest --full`: drawdown, fees, agent vs baseline[/]")
         return
     console.print(
         f"[key]Run {d['run_id']}[/] ({d['mode']}) · account return {pct(d['account_return_pct'], 3)} · "

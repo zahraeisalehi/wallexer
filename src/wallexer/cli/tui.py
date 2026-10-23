@@ -1,8 +1,8 @@
 """Full-screen app: `wallexer` with no arguments (Textual, alternate screen; the terminal comes back
 as it was on exit).
 
-- Header (2 rows, fits 80 columns): LOCAL/REMOTE, DEMO / SHADOW / LIVE badges, equity, PnL, drawdown,
-  agent stance and countdowns to entries-stop / flatten / end. Updated in place; a changed number
+- Header (1 row): DEMO / SHADOW / LIVE badges, equity, PnL and the next countdown only (entries stop,
+  flatten or end, whichever comes first; the rest is in `status`). Updated in place; a changed number
   pulses briefly.
 - Output: every command runs through the same `run_args` as the shell, in a worker thread, with the
   app's console swapped in: Rich tables and panels render here, `console.input()` prompts (trade
@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from rich.console import Console
@@ -39,6 +39,7 @@ from textual.suggester import SuggestFromList
 from textual.widgets import Input, RichLog, Static
 
 from wallexer.cli.theme import PALETTE, THEME, duration, pct, tmn
+from wallexer.cli.watch import WATCH_ROWS
 
 LOGO = """\
 ╻ ╻┏━┓╻  ╻  ┏━╸╻ ╻┏━╸┏━┓
@@ -73,22 +74,6 @@ def run_app(notice: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------------- helpers
-
-
-def _until(s: str | None, now: float) -> str:
-    """'2026-10-23 18:50 UTC' → '7h12m' (or 'passed')."""
-    if not s:
-        return "–"
-    try:
-        ts = datetime.strptime(s, "%Y-%m-%d %H:%M UTC").replace(tzinfo=UTC).timestamp()
-    except ValueError:
-        return "–"
-    left = int(ts - now)
-    if left <= 0:
-        return "passed"
-    h, rem = divmod(left, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}h{m:02d}m" if h else f"{m}m{sec:02d}s"
 
 
 def _history_file() -> Any:
@@ -207,10 +192,9 @@ class WallexerApp(App[None]):
     TITLE = "wallexer"
     CSS = f"""
     Screen {{ background: {P["bg"]}; color: {P["fg"]}; layout: vertical; }}
-    #head {{ height: 2; background: {P["panel"]}; padding: 0 1; }}
+    #head {{ height: 1; background: {P["panel"]}; padding: 0 1; }}
     .row {{ height: 1; overflow: hidden hidden; }}
     .row Static {{ width: auto; margin-right: 2; }}
-    #where {{ color: {P["head"]}; text-style: bold; }}
     .badge {{ padding: 0 1; text-style: bold; display: none; }}
     #b-demo {{ background: {P["demo"]}; color: white; }}
     #b-mode.shadow {{ background: {P["shadow"]}; color: black; display: block; }}
@@ -276,30 +260,25 @@ class WallexerApp(App[None]):
     # -------------------------------------------------------------- layout
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="head"):
-            with Horizontal(classes="row"):
-                yield Static("", id="where")
-                yield Static("DEMO", id="b-demo", classes="badge")
-                yield Static("", id="b-mode", classes="badge")
-                yield Static("", id="equity")
-                yield Static("", id="pnl")
-                yield Static("", id="dd")
-            with Horizontal(classes="row"):
-                yield Static("", id="agent")
-                yield Static("", id="countdown", classes="dim")
+        with Vertical(id="head"), Horizontal(classes="row"):
+            yield Static("DEMO", id="b-demo", classes="badge")
+            yield Static("", id="b-mode", classes="badge")
+            yield Static("", id="equity")
+            yield Static("", id="pnl")
+            yield Static("", id="countdown", classes="dim")
         with Vertical(id="watch"):
             yield Static("", id="wnum")
-            yield RichLog(id="wlog", wrap=True, markup=True, max_lines=400)
+            yield RichLog(id="wlog", wrap=True, markup=True, max_lines=WATCH_ROWS)
         yield RichLog(id="out", wrap=True, markup=False, max_lines=5000)
         yield Static("", id="stream")
         yield CmdInput(
-            placeholder="type a command · Tab completes · F1 help",
+            placeholder="type a command",
             suggester=SuggestFromList(self.words, case_sensitive=False),
             id="cmd",
         )
         yield Static("", id="hint")
         yield Static(
-            "Enter run · ↑↓ history · Tab complete · ^L clear · F1 help · q/^D quit",
+            "Enter run · Tab · F1 help · q quit",
             id="keys",
         )
 
@@ -317,14 +296,11 @@ class WallexerApp(App[None]):
             out.write(Text(self.notice, style=P["warn"]))
         if self.remote:
             msg = (
-                "Watching the public demo (read-only). Try: status · watch · sum · reason · rslt shadowtest"
+                "Public demo, read-only · try: status · watch · sum · reason"
                 if self.remote.demo
                 else f"Remote view of {self.remote.url} (read-only)."
             )
             out.write(Text(msg, style=P["muted"]))
-        out.write(
-            Text("help lists every command · `wallexer setup` runs your own engine", P["muted"])
-        )
         self.query_one("#cmd", Input).focus()
         self.poll_status()
         self.set_interval(REMOTE_REFRESH_S if self.remote else LOCAL_REFRESH_S, self.poll_status)
@@ -389,11 +365,7 @@ class WallexerApp(App[None]):
             w.styles.animate("background", Color.parse(P["head"]).with_alpha(0.0), duration=1.2)
 
     def _show_status(self, st: dict[str, Any] | None, live: bool, err: str | None) -> None:
-        from wallexer.cli.source import host
-
         r = self.remote
-        where = "REMOTE demo" if r and r.demo else f"REMOTE {host(r.url)}" if r else "LOCAL"
-        self._set("where", where, pulse=False)
         st = st or {}
         demo = self.query_one("#b-demo")
         demo.set_class(bool(st.get("demo")), "on")
@@ -403,8 +375,7 @@ class WallexerApp(App[None]):
         b.update("LIVE" if mode == "trade" else "SHADOW" if mode == "shadow" else "")
         if err:
             self._set("equity", Text(f"unreachable: {err}", style=P["err"]), pulse=False)
-            for w in ("pnl", "dd", "agent"):
-                self._set(w, "", pulse=False)
+            self._set("pnl", "", pulse=False)
             self.schedule = None
         elif st.get("starting"):
             self._set("equity", "engine starting…", pulse=False)
@@ -414,19 +385,12 @@ class WallexerApp(App[None]):
                 f"[{P['muted']}]engine not running · `shadowtest` starts one[/]",
                 pulse=False,
             )
-            for w in ("pnl", "dd", "agent"):
-                self._set(w, "", pulse=False)
+            self._set("pnl", "", pulse=False)
         else:
             pnl = st.get("pnl_pct_vs_start")
             col = P["err"] if str(pnl).startswith("-") else P["ok"]
             self._set("equity", f"equity {tmn(st.get('equity_tmn'))}")
             self._set("pnl", f"PnL [{col}]{pct(pnl, 3)}[/]")
-            self._set("dd", f"DD {pct(st.get('drawdown_pct'), 2, signed=False)}")
-            ag = st.get("agent") or {}
-            self._set(
-                "agent",
-                f"agent {ag.get('stance') or '–'} ×{ag.get('effective_risk_multiplier', '–')}",
-            )
         # Remote: the schedule comes from the server only (never the local EVENT_END_UTC).
         if not err:
             self.schedule = st.get("schedule") or (None if r else self._local_schedule())
@@ -445,16 +409,9 @@ class WallexerApp(App[None]):
         )
 
     def _tick_countdown(self) -> None:
-        sch, now = self.schedule, time.time()
-        if not sch or not sch.get("end"):
-            has_keys = self.settings is not None and self.settings.has_private
-            text = "schedule –" if self.remote or not has_keys else "EVENT_END_UTC not set"
-        else:
-            text = (
-                f"entries stop {_until(sch.get('entries_stop'), now)} · "
-                f"flatten {_until(sch.get('flatten_from'), now)} · end {_until(sch.get('end'), now)}"
-            )
-        self._set("countdown", text, pulse=False)
+        from wallexer.cli.engine_cmds import next_deadline
+
+        self._set("countdown", next_deadline(self.schedule, short=True) or "", pulse=False)
 
     # -------------------------------------------------------------- watch split
 
@@ -497,30 +454,18 @@ class WallexerApp(App[None]):
         feed = self.feed
         if feed is None:
             return
+        from wallexer.cli.watch import watch_lines
+
         try:
-            rows = [("d", r) for r in feed.decisions()] + [("e", r) for r in feed.events()]
+            lines = watch_lines(feed.decisions(), feed.events())
         except Exception:  # a hiccup in polling must not break the view
             return
-        self.call_from_thread(self._append_watch, rows)
+        self.call_from_thread(self._append_watch, lines)
 
-    def _append_watch(self, rows: list[tuple[str, dict[str, Any]]]) -> None:
+    def _append_watch(self, lines: list[str]) -> None:
         log = self.query_one("#wlog", RichLog)
-        for kind, r in rows:
-            if kind == "d":
-                log.write(
-                    f"[bold {P['head']}]{r['ts'][11:19]} decision #{r['id']}[/] {r['action']} "
-                    f"{r['symbol'] or ''} · {(r['reason'] or '')[:140]}"
-                )
-            else:
-                k = r["kind"]
-                col = (
-                    P["err"]
-                    if k.startswith("risk.")
-                    else P["warn"]
-                    if k.startswith("feed.")
-                    else P["muted"]
-                )
-                log.write(f"[{col}]{r['ts'][11:19]} {k}[/] {(r['payload'] or '')[:140]}")
+        for line in lines:
+            log.write(line)
 
     # -------------------------------------------------------------- output, spinner, stream
 
@@ -605,7 +550,7 @@ class WallexerApp(App[None]):
         shown = "•" * len(answer) if inp.password else answer
         self._write([Text(f"  › {shown}", style=P["muted"])])
         inp.password = False
-        inp.placeholder = "type a command · Tab completes · F1 help"
+        inp.placeholder = "type a command"
         inp.suggester = SuggestFromList(self.words, case_sensitive=False)
         q, self.prompt_q = self.prompt_q, None
         if q is not None:
@@ -723,6 +668,6 @@ class WallexerApp(App[None]):
     def _done(self, code: int) -> None:
         self.spin_label = None
         self.query_one("#hint", Static).update("" if code == 0 else f"[{P['muted']}]exit {code}[/]")
-        self.query_one("#cmd", Input).placeholder = "type a command · Tab completes · F1 help"
+        self.query_one("#cmd", Input).placeholder = "type a command"
         self._reload()  # e.g. after `setup`
         self.poll_status()

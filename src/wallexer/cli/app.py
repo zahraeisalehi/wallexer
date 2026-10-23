@@ -351,15 +351,17 @@ def trade(
 
 @_cmd("status")
 @friendly
-def status() -> None:
-    """Mode, equity, PnL, drawdown, schedule, per-market state, strategies, agent, feed."""
+def status(
+    full: bool = typer.Option(False, "--full", help="Show every detail (default: key lines only)."),
+) -> None:
+    """Mode, equity, PnL, drawdown, positions, agent, next deadline (`--full`: everything)."""
     from wallexer.cli.engine_cmds import NOT_RUNNING, render_status
 
     st, live, origin = source.status(load_settings())
     if st is None:
         console.print(NOT_RUNNING)
         raise typer.Exit(1)
-    render_status(st, live, console, origin)
+    render_status(st, live, console, origin, full=full)
 
 
 @_cmd("stop")
@@ -574,20 +576,26 @@ def agent_replay(
 
 @_cmd("log")
 @friendly
-def log(n: int = typer.Argument(None, help="Log entry id (default: all, paged).")) -> None:
-    """All logs (paged), or one entry in full."""
+def log(
+    n: int = typer.Argument(None, help="Log entry id (default: all, paged)."),
+    full: bool = typer.Option(False, "--full", help="Show every detail (default: key lines only)."),
+) -> None:
+    """All logs (paged, one-line summaries), or one entry in full."""
     from wallexer.cli.logs import show_log
 
-    show_log(load_settings(), console, n)
+    show_log(load_settings(), console, n, full)
 
 
 @_cmd("reason")
 @friendly
-def reason(n: int = typer.Argument(None, help="Decision id (default: overview).")) -> None:
-    """Static explanation: all transactions/algorithms, or one decision's numbers in full."""
+def reason(
+    n: int = typer.Argument(None, help="Decision id (default: overview)."),
+    full: bool = typer.Option(False, "--full", help="Show every detail (default: key lines only)."),
+) -> None:
+    """Static explanation: the decisions, or one decision's summary + key numbers (`--full`: all)."""
     from wallexer.cli.logs import show_reason
 
-    show_reason(load_settings(), console, n)
+    show_reason(load_settings(), console, n, full)
 
 
 @_cmd("exp-reason")
@@ -601,14 +609,17 @@ def exp_reason(n: int = typer.Argument(None, help="Decision id (default: latest)
 
 @_cmd("rslt")
 @friendly
-def rslt(which: str = typer.Argument(..., metavar="backtest|shadowtest")) -> None:
+def rslt(
+    which: str = typer.Argument(..., metavar="backtest|shadowtest"),
+    full: bool = typer.Option(False, "--full", help="Show every detail (default: key lines only)."),
+) -> None:
     """Latest run: return %, max drawdown, trades, win rate, avg trade, fees, per strategy, agent vs baseline."""
     from wallexer.cli.results import rslt as run
 
     which = {"shadow": "shadowtest", "bt": "backtest"}.get(which, which)
     if which not in ("backtest", "shadowtest"):
         raise InputError(f"unknown result {which!r}: use `rslt backtest` or `rslt shadowtest`")
-    run(load_settings(), console, which)
+    run(load_settings(), console, which, full)
 
 
 @_cmd("sum")
@@ -618,11 +629,12 @@ def sum_cmd(
         None, metavar="[DATE]", help="YYYY-MM-DD, today or yesterday (UTC). Default: today so far."
     ),
     refresh: bool = typer.Option(False, "--refresh", help="Regenerate even if this day is cached."),
+    full: bool = typer.Option(False, "--full", help="Show every detail (default: key lines only)."),
 ) -> None:
     """Daily market + agent summary: static facts, then an LLM explanation (anonymized, cached)."""
     from wallexer.cli.daily import run_sum
 
-    code = asyncio.run(run_sum(load_settings(), console, day, refresh))
+    code = asyncio.run(run_sum(load_settings(), console, day, refresh, full))
     if code:
         raise typer.Exit(code)
 
@@ -795,6 +807,17 @@ def setup(
         raise InputError(f"--mode {mode!r}: use local, remote or skip")
     if not run_setup(console, choice):
         raise typer.Exit(1)
+
+
+@_cmd("details")
+def details(
+    command: list[str] = typer.Argument(None, help="A view command and its arguments."),
+) -> None:
+    """Re-run a view with `--full`: `details` = `status --full`, `details reason 12`, `details sum`."""
+    args = command or ["status"]
+    if args[0] not in ("status", "log", "reason", "rslt", "sum"):
+        raise InputError(f"`details` works with status, log, reason, rslt and sum, not `{args[0]}`")
+    raise typer.Exit(run_args([*args, "--full"]))
 
 
 @_cmd("help")

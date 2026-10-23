@@ -19,15 +19,15 @@ from wallexer.store.db import init_db, log_event
 # ---------------------------------------------------------------------------------- rslt
 
 
-def rslt(settings: Settings, console: Console, which: str) -> None:
+def rslt(settings: Settings, console: Console, which: str, full: bool = False) -> None:
     """Local DB or remote API (cli/source.py); one renderer for both."""
     from wallexer.cli import source, views
 
     d = source.rslt(settings, which)
     if which == "backtest":
-        views.render_rslt_backtest(d, console)
+        views.render_rslt_backtest(d, console, full)
     else:
-        views.render_rslt_shadow(d, console)
+        views.render_rslt_shadow(d, console, full)
 
 
 # ---------------------------------------------------------------------------------- export
