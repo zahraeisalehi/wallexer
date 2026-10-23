@@ -32,7 +32,7 @@ from wallexer.alloc.regime import REGIME_TF, build_reference, classify
 from wallexer.alloc.usdt_inventory import decide as usdt_decide
 from wallexer.alloc.usdt_inventory import target_frac as usdt_target
 from wallexer.backtest.report import latest_run, stats_from_json
-from wallexer.config import ConfigError, Mode, Settings
+from wallexer.config import ConfigError, Mode, Settings, is_demo
 from wallexer.data.features import Features, basis_features, imbalance, market_features
 from wallexer.data.feed import MarketFeed
 from wallexer.data.history import load_bars, sync_history
@@ -78,6 +78,8 @@ class Engine:
     def __init__(self, settings: Settings, mode: Mode, markets: list[str] | None = None) -> None:
         if mode is Mode.backtest:
             raise ConfigError("engine runs shadow or trade; backtest is a separate command")
+        if mode is Mode.trade and is_demo():
+            raise ConfigError("demo server (WALLEXER_DEMO=1): trade mode is refused; shadow only")
         self.settings = settings
         self.mode = mode
         self.only = [m.upper() for m in markets] if markets else None
@@ -1244,6 +1246,7 @@ class Engine:
         return {
             "running": not self.stopping.is_set(),
             "mode": self.mode.value,
+            "demo": is_demo(),
             "run_id": self.run_id,
             "uptime_s": round(time.time() - self.started),
             "last_tick_age_s": None
@@ -1313,6 +1316,7 @@ class Engine:
         feed = getattr(self, "feed", None)
         return {
             "mode": self.mode.value,
+            "demo": is_demo(),
             "starting": self.last_tick is None,
             "last_tick": self.last_tick,
             "equity_tmn": f"{self.equity:.0f}",
@@ -1323,7 +1327,12 @@ class Engine:
     def _api_status(self) -> dict[str, Any]:
         # Startup (preflight, history sync) has not built the state yet: say so instead of failing.
         if self.last_tick is None:
-            return {"starting": True, "mode": self.mode.value, "run_id": self.run_id}
+            return {
+                "starting": True,
+                "mode": self.mode.value,
+                "demo": is_demo(),
+                "run_id": self.run_id,
+            }
         return self.snapshot()
 
     def _market_states(self) -> dict[str, str]:
@@ -1362,6 +1371,8 @@ class Engine:
     async def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         cmd = req.get("cmd")
         markets = {m.upper() for m in req.get("markets") or []}
+        if is_demo() and cmd in ("stop", "flatten", "resume", "start_markets"):
+            return {"ok": False, "error": f"demo server (WALLEXER_DEMO=1): `{cmd}` is refused"}
         if cmd == "agent_now":
             if not self.settings.cfg.agent.enabled:
                 return {"ok": False, "error": "agent disabled in config"}

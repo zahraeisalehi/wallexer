@@ -4,9 +4,10 @@ OpenAI-compatible gateway to many models (700+). Use the official `openai` Pytho
 
 ```python
 from openai import AsyncOpenAI
+
 client = AsyncOpenAI(base_url="https://ai.boxapi.ir/ai/v1", api_key=settings.boxapi_api_key)
 resp = await client.chat.completions.create(
-    model=settings.llm_model,            # e.g. "gpt-5.4-mini" (from config, never hard-coded)
+    model=settings.llm_model,  # e.g. "gpt-5.4-mini" (from config, never hard-coded)
     messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": snapshot_json}],
     temperature=0,
 )

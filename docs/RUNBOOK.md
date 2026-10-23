@@ -18,6 +18,7 @@ The smoke test must end with "SMOKE TEST PASSED". It also records whether balanc
 The app exists (created in the console: Docker, plan Mars = medium-g2, bundle Base = `basic`). Every
 liara command needs `--team-id 6ad87ba7cf87f9a8e45d4d3a` (also in `liara.json`); below `$T` stands for it.
 Deploy from a clean staging copy (no `.env`, no DB): see `deploy` section of the handoff / rsync excludes.
+`liara.json` targets this LIVE app; the demo app has its own guarded path (§2b).
 ```
 liara disk create -a wallexer --team-id $T -n data -s 1   # done 2026-10-22
 # secrets: run these yourself (never commit them, never paste them into chat)
@@ -58,6 +59,38 @@ wallexer status · wallexer watch · wallexer log · wallexer reason 12 · walle
 In a dev checkout instead: `WALLEXER_REMOTE_URL=https://wallexer.liara.run` + `WALLEXER_VIEW_TOKEN=...`
 in `.env`, then `wallexer --remote status`. In remote mode trade/stop/flatten/change/resume/config/
 autoset/shadowtest/engine/agent/doctor --live-smoke are refused before any request is made.
+
+## 2b. Demo app `wallexer-demo` (public demo, never trades)
+Separate app: team `$T`, network `wallexer-demo-net`, plan Mars + Base, its own disk `data` → `/app/data`
+(created 2026-10-23, 1 GB). Its env vars are set by you, with a **read-only** Wallex key.
+**`liara.json` is the LIVE app.** A bare `liara deploy` from the repo deploys production. The demo is
+deployed only with the guarded script, which never reads `liara.json`:
+```
+deploy/deploy-demo.sh --check   # checks + clean staging copy, no deploy
+deploy/deploy-demo.sh           # deploy wallexer-demo
+```
+The script refuses (exit 1) if `liara.demo.json` or `$APP` name `wallexer` or anything other than
+`wallexer-demo`, if `WALLEX_API_KEY`/`WALLEX_SUBACCOUNT_ID` are missing on the demo app (key names only
+are listed, never values), if `WALLEXER_MODE` is set and not `shadow`, or if `WALLEXER_DEMO` is set and
+not `1`. It stages tracked files without `.env*`, DBs, logs or `liara.json`, then runs
+`liara deploy --app wallexer-demo --liara-json liara.demo.json --build-arg WALLEXER_DEMO=1 ...`.
+
+`WALLEXER_DEMO=1` (baked into the demo image; an env var with another value would override it, the
+script refuses that) means:
+- the engine refuses `--mode trade`; `LiveExecutor` refuses to start;
+- the order latch can never open: `enable_orders()` raises, and every order/cancel request is refused
+  again even if the flag were set;
+- the CLI refuses `trade/stop/flatten/change/resume` (exit 2); the engine's control socket refuses
+  `stop/flatten/resume/start_markets`;
+- `config/demo.toml` is layered on top: depth every 15 s, trades 60 s, candles 180 s, feed budget 15 %
+  of the rate limit, 6 markets, 10 days of history (strategy/risk/allocation settings unchanged);
+- `/health` and `/api/status` report `"demo": true`.
+```
+curl -s https://wallexer-demo.liara.run/health                               # mode shadow, demo true
+curl -s -H "X-View-Token: $TOKEN" https://wallexer-demo.liara.run/api/status  # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://wallexer-demo.liara.run/api/status   # 401
+liara shell -a wallexer-demo --team-id $T -c "wallexer trade"                # refused, exit 2
+```
 
 ## 3. Switch shadow → trade (only after the smoke test passed and you said so)
 ```

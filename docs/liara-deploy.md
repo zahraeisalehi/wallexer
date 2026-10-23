@@ -24,3 +24,4 @@ Liara is an Iranian PaaS with a CLI (`liara`, installed via `npm install -g @lia
 - Non-interactive create: `liara app create -a wallexer --platform docker --plan standard-base-g2 --feature-plan standard -n wallexer-net -r false`.
 - Build location `iran` (user choice). Image: `Dockerfile` (python 3.12-slim + uv, `uv sync --frozen --no-dev`), start script `deploy/entrypoint.sh`, config `liara.json` (port 8000, disk `data` → `/app/data`).
 - Step-by-step operations: `docs/RUNBOOK.md`.
+- Demo app `wallexer-demo` (2026-10-23): deploy ONLY via `deploy/deploy-demo.sh` (uses `liara.demo.json`, refuses the live app `wallexer`, bakes `WALLEXER_DEMO=1`). `liara.json` is the live app: never run a bare `liara deploy` for the demo.
