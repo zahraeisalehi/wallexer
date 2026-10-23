@@ -15,6 +15,9 @@ dependencies = [
     "polars>=1.0",
     "textual>=8.2.8",
     "prompt-toolkit>=3.0.53",
+    "platformdirs>=4.2",
+    # zoneinfo data for Tehran time in `sum` (slim images and some macOS Pythons lack it)
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
@@ -29,6 +32,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wallexer"]
+
+# An installed CLI (uv tool install) has no repo checkout: ship the defaults and market lists.
+[tool.hatch.build.targets.wheel.force-include]
+"config/default.toml" = "wallexer/_resources/default.toml"
+"data/not_allowed.txt" = "wallexer/_resources/not_allowed.txt"
+"data/unavailable_markets.txt" = "wallexer/_resources/unavailable_markets.txt"
 
 [tool.ruff]
 line-length = 100

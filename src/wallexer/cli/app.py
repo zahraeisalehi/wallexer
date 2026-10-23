@@ -1,60 +1,137 @@
-"""wallexer CLI entry point (Typer). Commands print short errors, never tracebacks."""
+"""wallexer CLI entry point (Typer). Commands print short errors, never tracebacks.
+
+`wallexer` alone opens the interactive shell (cli/repl.py). `--remote` makes the read-only views
+(status, watch, log, reason, rslt, sum) read the server's API; commands that change state are
+refused in remote mode before any request is made.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import functools
 import os
+import sys
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
 import typer
-from rich.console import Console
 
+from wallexer.cli import source
+from wallexer.cli.help import PANEL
+from wallexer.cli.theme import make_console
 from wallexer.config import ConfigError, load_settings
 from wallexer.exchange.account import PreflightError
 from wallexer.exchange.errors import WallexError
 from wallexer.logging import setup_logging
 
-console = Console()
-err_console = Console(stderr=True)
+console = make_console()
+err_console = make_console(stderr=True)
 
 app = typer.Typer(
     name="wallexer",
-    help="Automated spot-trading engine + CLI for Wallex (wallex.ir).",
+    help="Automated spot-trading engine + CLI for Wallex (wallex.ir). `wallexer help` lists every command.",
     add_completion=False,
     pretty_exceptions_enable=False,
+    rich_markup_mode="rich",
 )
 
 
+def _cmd(name: str, **kw: Any) -> Callable[..., Any]:
+    """app.command with its help panel (Trading, Testing, Results, Explain, Guardrails, System)."""
+    return app.command(name, rich_help_panel=PANEL.get(name), **kw)
+
+
+class InputError(ValueError):
+    """A bad argument value: printed with the command's usage hint."""
+
+
+def _err(msg: str, hint: str) -> None:
+    err_console.print(f"[err]error:[/] {msg}")
+    err_console.print(f"[muted]hint: {hint}[/]")
+
+
 def friendly(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Turn expected failures into a one-line error + hint, exit code 1."""
+    """Turn expected failures into a one-line error + hint, exit code 1 (2 for bad input)."""
+    name = fn.__name__.removesuffix("_cmd").replace("_", "-")
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        from wallexer.cli.backtest_cmds import BacktestInputError
+        from wallexer.cli.daily import DateError
+
         try:
             return fn(*args, **kwargs)
-        except (ConfigError, PreflightError, WallexError, FileNotFoundError) as e:
-            err_console.print(f"[bold red]error:[/] {e}")
-            err_console.print("[dim]hint: run `wallexer doctor` to check configuration.[/]")
+        except (InputError, BacktestInputError, DateError) as e:
+            _err(str(e), f"`wallexer help {name.split('-')[0]}` shows the usage")
+            raise typer.Exit(2) from None
+        except source.RemoteReadOnly as e:
+            _err(str(e), "run it on the server, or locally without --remote")
+            raise typer.Exit(2) from None
+        except source.RemoteError as e:
+            _err(str(e), "check the server URL and view token: `wallexer setup`")
+            raise typer.Exit(1) from None
+        except ConfigError as e:
+            _err(str(e), "`wallexer doctor` checks the configuration; `wallexer setup` sets keys")
+            raise typer.Exit(1) from None
+        except (PreflightError, WallexError) as e:
+            _err(str(e), "`wallexer doctor` checks connectivity, keys and the trading credit")
+            raise typer.Exit(1) from None
+        except FileNotFoundError as e:
+            _err(str(e), "`wallexer doctor` checks the configuration")
             raise typer.Exit(1) from None
         except KeyboardInterrupt:
-            err_console.print("[yellow]interrupted[/]")
+            err_console.print("[warn]interrupted[/] (a running engine is not affected)")
             raise typer.Exit(130) from None
         except typer.Exit:
             raise
         except Exception as e:  # last resort: never show a raw traceback to the user
             if os.environ.get("WALLEXER_DEBUG"):
                 raise
-            err_console.print(f"[bold red]unexpected error:[/] {type(e).__name__}: {str(e)[:200]}")
-            err_console.print("[dim]hint: re-run with WALLEXER_DEBUG=1 for a traceback.[/]")
+            _err(
+                f"unexpected {type(e).__name__}: {str(e)[:200]}",
+                "re-run with WALLEXER_DEBUG=1 for a traceback",
+            )
             raise typer.Exit(1) from None
 
     return wrapper
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
+def root(
+    ctx: typer.Context,
+    remote: bool = typer.Option(
+        False, "--remote", help="Read status/watch/log/reason/rslt/sum from the server (read-only)."
+    ),
+) -> None:
+    if remote:
+        source.FORCED_REMOTE["on"] = True
+    cmd = ctx.invoked_subcommand
+    if cmd is None:
+        from wallexer.cli.repl import run_repl
+        from wallexer.cli.setup import needs_setup, run_setup
+
+        if needs_setup() and sys.stdin.isatty():
+            ans = console.input("No configuration yet. Run the setup wizard now? \\[Y/n] ")
+            if ans.strip().lower() not in ("n", "no"):
+                run_setup(console)
+        run_repl(app, console)
+        return
+    if cmd in source.WRITE_COMMANDS:
+        try:
+            on = source.FORCED_REMOTE["on"] or load_settings().cfg.remote.default
+        except ConfigError:
+            on = source.FORCED_REMOTE["on"]
+        if on:
+            _err(
+                f"`{cmd}` is disabled in remote mode (read-only viewing)",
+                "run it on the server, or locally without --remote",
+            )
+            raise typer.Exit(2)
+
+
+@_cmd("markets")
 @friendly
 def markets(
     all_: bool = typer.Option(
@@ -67,7 +144,7 @@ def markets(
     asyncio.run(run(load_settings(), console, show_all=all_))
 
 
-@app.command()
+@_cmd("doctor")
 @friendly
 def doctor(
     quick: bool = typer.Option(
@@ -87,6 +164,7 @@ def doctor(
     if live_smoke:
         from wallexer.cli.smoke import run_smoke
 
+        source.guard_write(load_settings(), "doctor --live-smoke")
         if not asyncio.run(run_smoke(load_settings(), console, Decimal(str(discount_pct)))):
             raise typer.Exit(1)
         return
@@ -97,7 +175,7 @@ def doctor(
 
 
 engine_app = typer.Typer(help="Engine daemon (long-running).", no_args_is_help=True)
-app.add_typer(engine_app, name="engine")
+app.add_typer(engine_app, name="engine", rich_help_panel="System")
 
 
 @engine_app.command("run")
@@ -127,73 +205,127 @@ def engine_run(
     asyncio.run(Engine(settings, m, market or None).run())
 
 
-@app.command()
+def _markets(markets: list[str] | None) -> list[str]:
+    return sorted({m.strip().upper() for m in markets or [] for m in m.split(",") if m.strip()})
+
+
+def _engine_mode(settings: Any) -> str | None:
+    from wallexer.cli.engine_cmds import sock
+    from wallexer.engine import control
+
+    try:
+        return control.send(sock(settings), "ping", timeout=3).get("mode")
+    except (control.EngineNotRunning, OSError):
+        return None
+
+
+def _start_markets(settings: Any, mode: str, mkts: list[str]) -> None:
+    from wallexer.cli.engine_cmds import sock
+    from wallexer.engine import control
+
+    resp = control.send(sock(settings), "start_markets", markets=mkts, mode=mode)
+    if not resp.get("ok"):
+        raise InputError(resp.get("error", "engine refused"))
+    still = resp.get("paused") or []
+    console.print(
+        f"[ok]started[/] {', '.join(resp['started'])} on the running {mode} engine"
+        + (f" · still stopped: {', '.join(still)}" if still else "")
+    )
+
+
+def _launch(settings: Any, mode: Any, mkts: list[str], no_watch: bool) -> None:
+    from wallexer.cli.engine_cmds import spawn, wait_ready
+
+    pid = spawn(settings, mode, mkts)
+    if not wait_ready(settings, console):
+        _err("the engine did not come up", f"see {settings.cfg.path(settings.cfg.engine.log_path)}")
+        raise typer.Exit(1)
+    label = "[live] LIVE engine [/]" if mode.value == "trade" else "[shadow] SHADOW engine [/]"
+    scope = ", ".join(mkts) if mkts else "whole universe"
+    console.print(f"{label} running (pid {pid}) · {scope} · `wallexer status`, `wallexer stop`")
+    if not no_watch and sys.stdout.isatty():
+        from wallexer.cli.watch import run_watch
+
+        run_watch(settings)
+        console.print("[muted]view closed · the engine keeps running[/]")
+
+
+@_cmd("shadowtest")
 @friendly
 def shadowtest(
     markets: list[str] = typer.Argument(None, help="Markets (default: whole universe)."),
+    no_watch: bool = typer.Option(False, "--no-watch", help="Do not open the live view."),
 ) -> None:
-    """Start shadow mode (live data, simulated orders) as a detached engine."""
-    from wallexer.cli.engine_cmds import engine_running, spawn, wait_ready
+    """Start shadow mode (live data, simulated orders) and open the live view."""
     from wallexer.config import Mode
 
     settings = load_settings()
-    if engine_running(settings):
-        console.print(
-            "[yellow]Engine already running.[/] Use `wallexer status`, or `wallexer stop` first."
+    mkts = _markets(markets)
+    running = _engine_mode(settings)
+    if running == "shadow" and mkts:
+        _start_markets(settings, "shadow", mkts)
+        return
+    if running:
+        _err(
+            f"an engine is already running ({running})",
+            "`wallexer status`; `wallexer stop` first, or `wallexer change` to switch modes",
         )
         raise typer.Exit(1)
-    pid = spawn(settings, Mode.shadow, [m.upper() for m in markets or []])
-    if wait_ready(settings, console):
-        console.print(
-            f"[green]Shadow engine running[/] (pid {pid}). `wallexer status` to watch, `wallexer stop` to stop."
-        )
-    else:
-        console.print(f"[red]Engine did not come up.[/] See {settings.cfg.engine.log_path}.")
-        raise typer.Exit(1)
+    _launch(settings, Mode.shadow, mkts, no_watch)
 
 
-@app.command()
+@_cmd("trade")
 @friendly
 def trade(
     markets: list[str] = typer.Argument(None, help="Markets (default: whole universe)."),
+    no_watch: bool = typer.Option(False, "--no-watch", help="Do not open the live view."),
 ) -> None:
-    """Start LIVE trading (real orders) after the human-in-the-loop prompt and confirmation."""
-    from wallexer.cli.engine_cmds import engine_running, human_in_the_loop, spawn, wait_ready
+    """Start LIVE trading (real orders) after the review prompt and a typed confirmation.
+
+    On a running trade engine, `trade MARKET` re-starts only that market (after `stop MARKET`).
+    """
+    from wallexer.cli.engine_cmds import confirm_trade
     from wallexer.config import Mode
 
     settings = load_settings()
-    if engine_running(settings):
-        console.print("[yellow]An engine is already running.[/] Stop it first (`wallexer stop`).")
+    mkts = _markets(markets)
+    running = _engine_mode(settings)
+    if running == "shadow":
+        _err(
+            "a SHADOW engine is running",
+            "switch with `wallexer change shadowtest trade` (asks the same questions)",
+        )
         raise typer.Exit(1)
-    if not human_in_the_loop(settings, console):
-        console.print("OK: review first. Run `wallexer shadowtest` and `wallexer status`.")
-        raise typer.Exit(0)
-    confirm = console.input("[bold red]This places REAL orders.[/] Type TRADE to start: ").strip()
-    if confirm != "TRADE":
-        console.print("Not confirmed. Nothing started.")
+    if running == "trade":
+        if not mkts:
+            _err(
+                "the live engine is already running",
+                "`wallexer status`; `wallexer trade MARKET` restarts one market",
+            )
+            raise typer.Exit(1)
+        if confirm_trade(settings, console, f"trade {' '.join(mkts)} on the running engine"):
+            _start_markets(settings, "trade", mkts)
+            return
         raise typer.Exit(1)
-    pid = spawn(settings, Mode.trade, [m.upper() for m in markets or []])
-    if wait_ready(settings, console):
-        console.print(f"[bold red]LIVE engine running[/] (pid {pid}).")
-    else:
-        console.print(f"[red]Engine did not come up.[/] See {settings.cfg.engine.log_path}.")
+    if not confirm_trade(settings, console, f"trade {' '.join(mkts) or 'whole universe'}"):
         raise typer.Exit(1)
+    _launch(settings, Mode.trade, mkts, no_watch)
 
 
-@app.command()
+@_cmd("status")
 @friendly
 def status() -> None:
-    """Engine status: mode, equity, drawdown, strategies (backtest + shadow), feed health."""
-    from wallexer.cli.engine_cmds import NOT_RUNNING, get_status, render_status
+    """Mode, equity, PnL, drawdown, schedule, per-market state, strategies, agent, feed."""
+    from wallexer.cli.engine_cmds import NOT_RUNNING, render_status
 
-    st, live = get_status(load_settings())
+    st, live, origin = source.status(load_settings())
     if st is None:
         console.print(NOT_RUNNING)
         raise typer.Exit(1)
-    render_status(st, live, console)
+    render_status(st, live, console, origin)
 
 
-@app.command()
+@_cmd("stop")
 @friendly
 def stop(
     markets: list[str] = typer.Argument(None, help="Markets to stop (default: everything)."),
@@ -202,17 +334,25 @@ def stop(
     from wallexer.cli.engine_cmds import NOT_RUNNING, sock
     from wallexer.engine import control
 
+    mkts = _markets(markets)
     try:
-        resp = control.send(
-            sock(load_settings()), "stop", markets=[m.upper() for m in markets or []]
-        )
+        resp = control.send(sock(load_settings()), "stop", markets=mkts)
     except control.EngineNotRunning:
         console.print(NOT_RUNNING)
         raise typer.Exit(1) from None
-    console.print(resp)
+    if mkts:
+        console.print(
+            f"[warn]stopped[/] {', '.join(mkts)}: no new entries, open orders cancelled · "
+            f"stopped now: {', '.join(resp.get('paused') or [])} · restart one with "
+            f"`wallexer trade {mkts[0]}` (or `shadowtest {mkts[0]}`)"
+        )
+    else:
+        console.print(
+            "[warn]engine stopping[/] · positions are kept; `wallexer flatten` sells them"
+        )
 
 
-@app.command()
+@_cmd("flatten")
 @friendly
 def flatten(
     markets: list[str] = typer.Argument(None, help="Markets to flatten (default: all balances)."),
@@ -221,18 +361,26 @@ def flatten(
     from wallexer.cli.engine_cmds import NOT_RUNNING, sock
     from wallexer.engine import control
 
-    try:
-        resp = control.send(
-            sock(load_settings()), "flatten", markets=[m.upper() for m in markets or []]
-        )
-    except control.EngineNotRunning:
+    settings = load_settings()
+    mkts = _markets(markets)
+    mode = _engine_mode(settings)
+    if mode is None:
         console.print(NOT_RUNNING)
-        raise typer.Exit(1) from None
-    console.print(resp)
+        raise typer.Exit(1)
+    if mode == "trade":
+        what = ", ".join(mkts) or "ALL non-TMN balances"
+        ans = (
+            console.input(f"[err]Sell {what} to TMN with REAL orders?[/] \\[y/N] ").strip().lower()
+        )
+        if ans not in ("y", "yes"):
+            console.print("Cancelled.")
+            raise typer.Exit(1)
+    resp = control.send(sock(settings), "flatten", markets=mkts)
+    console.print(f"[ok]flatten requested[/] ({resp.get('flatten')}) · progress: `wallexer status`")
 
 
 history_app = typer.Typer(help="Candle history (30 days, incremental).", no_args_is_help=True)
-app.add_typer(history_app, name="history")
+app.add_typer(history_app, name="history", rich_help_panel="Testing")
 
 
 @history_app.command("sync")
@@ -246,26 +394,56 @@ def history_sync(
     asyncio.run(run_history_sync(load_settings(), console, days))
 
 
-@app.command()
+def _date(v: str | None, opt: str) -> Any:
+    from datetime import UTC, datetime
+
+    if not v:
+        return None
+    try:
+        d = datetime.fromisoformat(v)
+    except ValueError:
+        raise InputError(f"{opt} {v!r}: use YYYY-MM-DD (or YYYY-MM-DDTHH:MM), UTC") from None
+    return d if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+@_cmd("backtest")
 @friendly
 def backtest(
-    walk_forward: bool = typer.Option(
-        False, "--walk-forward", help="Tune on the oldest 2/3 of history, judge on the newest 1/3."
+    date_from: str = typer.Option(
+        None, "--from", help="Start (UTC, YYYY-MM-DD). Default: 30 days ago."
     ),
+    date_to: str = typer.Option(None, "--to", help="End (UTC, YYYY-MM-DD). Default: now."),
+    markets: list[str] = typer.Option(
+        None, "--markets", help="Markets, comma-separated or repeated. Default: universe."
+    ),
+    timeframe: list[int] = typer.Option(
+        None,
+        "--timeframe",
+        "--resolution",
+        help="Minutes: 1, 5, 15, 60 (repeatable). Default: config.",
+    ),
+    walk_forward: bool = typer.Option(True, "--walk-forward", hidden=True),
     if_older_than: float = typer.Option(
-        0,
-        "--if-older-than",
-        help="Skip if the latest walk-forward run is younger than this many hours.",
+        0, "--if-older-than", help="Skip if the latest default run is younger than this many hours."
     ),
 ) -> None:
-    """Backtest on stored candles (30 days, incremental sync first)."""
+    """Walk-forward backtest on stored candles (tune on the oldest 2/3, judge on the newest 1/3).
+
+    No options = the config values: the run the promotion gate uses. Any option makes a custom
+    run (shown by `rslt backtest`, never used for promotion).
+    """
     from wallexer.cli.backtest_cmds import run_walk_forward
 
-    if not walk_forward:
-        console.print("Only --walk-forward is implemented: `wallexer backtest --walk-forward`.")
-        raise typer.Exit(1)
+    del walk_forward  # always walk-forward; the flag is kept for the engine's re-run loop
+    bad = [t for t in timeframe or [] if t not in (1, 5, 15, 60)]
+    if bad:
+        raise InputError(f"--timeframe {bad}: allowed 1, 5, 15, 60")
+    lo, hi = _date(date_from, "--from"), _date(date_to, "--to")
+    if lo and hi and lo >= hi:
+        raise InputError("--from must be before --to")
     settings = load_settings()
-    if if_older_than > 0:
+    custom = bool(lo or hi or markets or timeframe)
+    if if_older_than > 0 and not custom:
         from datetime import UTC, datetime
 
         from wallexer.backtest.report import latest_run
@@ -281,11 +459,20 @@ def backtest(
                     f"Latest walk-forward run #{row['id']} is {age_h:.1f} h old: skipped."
                 )
                 return
-    asyncio.run(run_walk_forward(settings, console))
+    asyncio.run(
+        run_walk_forward(
+            settings,
+            console,
+            date_from=lo,
+            date_to=hi,
+            markets=_markets(markets) or None,
+            timeframes=timeframe or None,
+        )
+    )
 
 
 research_app = typer.Typer(help="Research studies (read-only, no orders).", no_args_is_help=True)
-app.add_typer(research_app, name="research")
+app.add_typer(research_app, name="research", rich_help_panel="Testing")
 
 
 @research_app.command("spread")
@@ -315,7 +502,7 @@ def research_basis() -> None:
 
 
 agent_app = typer.Typer(help="LLM agent.", no_args_is_help=True)
-app.add_typer(agent_app, name="agent")
+app.add_typer(agent_app, name="agent", rich_help_panel="Explain")
 
 
 @agent_app.command("now")
@@ -331,7 +518,7 @@ def agent_now() -> None:
         console.print(NOT_RUNNING)
         raise typer.Exit(1) from None
     if not resp.get("ok"):
-        console.print(f"[red]{resp.get('error')}[/]")
+        console.print(f"[err]{resp.get('error')}[/]")
         raise typer.Exit(1)
     render_agent(resp["agent"] | {"applied": True}, console)
 
@@ -348,7 +535,7 @@ def agent_replay(
         raise typer.Exit(1)
 
 
-@app.command()
+@_cmd("log")
 @friendly
 def log(n: int = typer.Argument(None, help="Log entry id (default: all, paged).")) -> None:
     """All logs (paged), or one entry in full."""
@@ -357,7 +544,7 @@ def log(n: int = typer.Argument(None, help="Log entry id (default: all, paged)."
     show_log(load_settings(), console, n)
 
 
-@app.command()
+@_cmd("reason")
 @friendly
 def reason(n: int = typer.Argument(None, help="Decision id (default: overview).")) -> None:
     """Static explanation: all transactions/algorithms, or one decision's numbers in full."""
@@ -366,7 +553,7 @@ def reason(n: int = typer.Argument(None, help="Decision id (default: overview)."
     show_reason(load_settings(), console, n)
 
 
-@app.command("exp-reason")
+@_cmd("exp-reason")
 @friendly
 def exp_reason(n: int = typer.Argument(None, help="Decision id (default: latest).")) -> None:
     """LLM explanation of `reason n` (anonymized; summary, why, risk, confidence)."""
@@ -375,19 +562,35 @@ def exp_reason(n: int = typer.Argument(None, help="Decision id (default: latest)
     asyncio.run(run(load_settings(), console, n))
 
 
-@app.command()
+@_cmd("rslt")
 @friendly
-def rslt(which: str = typer.Argument(..., help="backtest | shadowtest")) -> None:
-    """Summary of the latest backtest or shadowtest run."""
+def rslt(which: str = typer.Argument(..., metavar="backtest|shadowtest")) -> None:
+    """Latest run: return %, max drawdown, trades, win rate, avg trade, fees, per strategy, agent vs baseline."""
     from wallexer.cli.results import rslt as run
 
+    which = {"shadow": "shadowtest", "bt": "backtest"}.get(which, which)
     if which not in ("backtest", "shadowtest"):
-        console.print("[red]usage:[/] wallexer rslt <backtest|shadowtest>")
-        raise typer.Exit(2)
+        raise InputError(f"unknown result {which!r}: use `rslt backtest` or `rslt shadowtest`")
     run(load_settings(), console, which)
 
 
-@app.command()
+@_cmd("sum")
+@friendly
+def sum_cmd(
+    day: str = typer.Argument(
+        None, metavar="[DATE]", help="YYYY-MM-DD, today or yesterday (UTC). Default: today so far."
+    ),
+    refresh: bool = typer.Option(False, "--refresh", help="Regenerate even if this day is cached."),
+) -> None:
+    """Daily market + agent summary: static facts, then an LLM explanation (anonymized, cached)."""
+    from wallexer.cli.daily import run_sum
+
+    code = asyncio.run(run_sum(load_settings(), console, day, refresh))
+    if code:
+        raise typer.Exit(code)
+
+
+@_cmd("export")
 @friendly
 def export() -> None:
     """Zip decisions, orders, fills, equity, allocations, llm_calls, reports, basis study, dust, config."""
@@ -419,9 +622,9 @@ async def _basis_markdown(settings) -> str | None:
 
 
 config_app = typer.Typer(help="Configuration.", no_args_is_help=True)
-app.add_typer(config_app, name="config")
+app.add_typer(config_app, name="config", rich_help_panel="Guardrails")
 autoset_app = typer.Typer(help="LLM-suggested settings (never auto-applied).", no_args_is_help=True)
-app.add_typer(autoset_app, name="autoset")
+app.add_typer(autoset_app, name="autoset", rich_help_panel="Guardrails")
 
 
 def _reload_engine() -> None:
@@ -432,7 +635,7 @@ def _reload_engine() -> None:
         resp = control.send(sock(load_settings()), "reload")
         console.print(f"engine: {resp}")
     except control.EngineNotRunning:
-        console.print("[dim]engine not running: applies at next start[/]")
+        console.print("[muted]engine not running: applies at next start[/]")
 
 
 @config_app.command("guardrail")
@@ -443,7 +646,7 @@ def config_guardrail() -> None:
 
     changes = run(load_settings(), console)
     if changes:
-        console.print(f"[green]saved[/] {changes}")
+        console.print(f"[ok]saved[/] {changes}")
         _reload_engine()
     else:
         console.print("No changes.")
@@ -466,13 +669,13 @@ def autoset_guardrail() -> None:
     }
     changes = asyncio.run(run(settings, console, stats))
     if changes:
-        console.print(f"[green]accepted and saved[/] {changes}")
+        console.print(f"[ok]accepted and saved[/] {changes}")
         _reload_engine()
     else:
         console.print("Nothing applied.")
 
 
-@app.command()
+@_cmd("change")
 @friendly
 def change(
     src: str = typer.Argument(..., metavar="FROM", help="backtest | shadowtest | trade"),
@@ -486,16 +689,19 @@ def change(
         raise typer.Exit(code)
 
 
-@app.command()
+@_cmd("watch")
 @friendly
 def watch() -> None:
     """Live dashboard (Textual). `q` / Quit closes the view only; the engine keeps running."""
     from wallexer.cli.watch import run_watch
 
-    run_watch(load_settings())
+    settings = load_settings()
+    if not sys.stdout.isatty():
+        raise InputError("watch needs an interactive terminal; use `wallexer status` instead")
+    run_watch(settings)
 
 
-@app.command()
+@_cmd("resume")
 @friendly
 def resume() -> None:
     """Lift a hard drawdown stop (human decision). Drawdown is measured again from current equity."""
@@ -519,7 +725,7 @@ def resume() -> None:
         console.print("Recorded; the engine will start without the hard stop.")
 
 
-@app.command()
+@_cmd("health")
 @friendly
 def health() -> None:
     """Print the engine's /health JSON (handy inside the container: no quoting needed)."""
@@ -532,20 +738,78 @@ def health() -> None:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5).read().decode()
         )
     except OSError as e:
-        console.print(f"[red]health endpoint unreachable on :{port}[/] ({e})")
+        console.print(f"[err]health endpoint unreachable on :{port}[/] ({e})")
         raise typer.Exit(1) from None
 
 
-def main() -> None:
-    import sys
+@_cmd("setup")
+@friendly
+def setup(
+    mode: str = typer.Option(None, "--mode", help="local | remote | skip (default: ask)."),
+) -> None:
+    """First-run wizard: local keys (Wallex, BoxAPI) or remote viewing (server URL + view token)."""
+    from wallexer.cli.setup import run_setup
 
-    setup_logging()
-    if len(sys.argv) == 1:
-        from wallexer.cli.repl import run_repl
+    choice = {"local": "1", "remote": "2", "skip": "3", None: None}.get(mode)
+    if mode and choice is None:
+        raise InputError(f"--mode {mode!r}: use local, remote or skip")
+    if not run_setup(console, choice):
+        raise typer.Exit(1)
 
-        run_repl(app, console)
+
+@_cmd("help")
+def help_cmd(command: list[str] = typer.Argument(None, help="A command (and subcommand).")) -> None:
+    """All commands grouped, with one line and an example each; `help CMD` for its options."""
+    from wallexer.cli.help import render_help
+
+    if not command:
+        render_help(console)
         return
-    app()
+    raise typer.Exit(run_args([*command, "--help"]))
+
+
+def _usage_error(e: Any, group: Any) -> int:
+    msg = e.format_message() if hasattr(e, "format_message") else str(e)
+    ctx = getattr(e, "ctx", None)
+    hint = "`wallexer help` lists every command"
+    if msg.startswith("No such command"):
+        bad = msg.split("'")[1] if "'" in msg else ""
+        close = difflib.get_close_matches(bad, list(group.commands), n=1)
+        msg = f"unknown command `{bad}`" + (f": did you mean `{close[0]}`?" if close else "")
+    elif ctx is not None and ctx.command is not None and ctx.info_name not in (None, "wallexer"):
+        hint = f"{ctx.get_usage().replace('Usage: ', 'usage: ')} · `wallexer help {ctx.info_name}`"
+    _err(msg, hint)
+    return 2
+
+
+def run_args(args: list[str]) -> int:
+    """Run one command line (shell or REPL) with short errors instead of Click's boxes."""
+    group: Any = typer.main.get_command(app)
+    try:
+        rv = group.main(args=args, prog_name="wallexer", standalone_mode=False)
+        return rv if isinstance(rv, int) else 0
+    except Exception as e:  # Click exceptions (vendored by Typer): duck-typed by name
+        name = type(e).__name__
+        if name == "Exit":
+            return int(getattr(e, "exit_code", 0))
+        if name == "Abort":
+            err_console.print("[warn]aborted[/] (a running engine is not affected)")
+            return 130
+        if hasattr(e, "format_message"):
+            return _usage_error(e, group)
+        if os.environ.get("WALLEXER_DEBUG"):
+            raise
+        _err(f"unexpected {name}: {str(e)[:200]}", "re-run with WALLEXER_DEBUG=1 for a traceback")
+        return 1
+
+
+def main() -> None:
+    import logging
+
+    # Commands report problems themselves; library warnings (e.g. the known /depth/all 503 with
+    # its per-market fallback) would only add noise. `engine run` sets up JSON logging itself.
+    setup_logging(level=logging.ERROR)
+    sys.exit(run_args(sys.argv[1:]))
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from wallexer.data.features import Features, basis_features, imbalance, market_f
 from wallexer.data.feed import MarketFeed
 from wallexer.data.history import load_bars, sync_history
 from wallexer.engine import control, health
+from wallexer.engine.api import ReadOnlyApi
 from wallexer.exchange.account import CreditCheck, PreflightError, preflight_live
 from wallexer.exchange.client import WallexClient
 from wallexer.exchange.errors import ApiError, TransportError
@@ -1302,6 +1303,7 @@ class Engine:
                 "report": self.wf.get("report"),
             },
             "dust": self.dust,
+            "market_states": self._market_states(),
             "open_orders": len(self.executor.open_orders),
             "preflight": self.credit.message if self.credit else None,
         }
@@ -1317,6 +1319,35 @@ class Engine:
             "errors": self.errors + (feed.errors if feed else 0),
             "ok": self.last_tick is not None and time.time() - self.last_tick < 30,
         }
+
+    def _api_status(self) -> dict[str, Any]:
+        # Startup (preflight, history sync) has not built the state yet: say so instead of failing.
+        if self.last_tick is None:
+            return {"starting": True, "mode": self.mode.value, "run_id": self.run_id}
+        return self.snapshot()
+
+    def _market_states(self) -> dict[str, str]:
+        """Per-market scope for `status`: human stop > agent pause > agent inactive > book issue."""
+        f = self.last_features
+        fresh = self._agent_fresh() and self.agent_applied is not None
+        out = {}
+        for sym in self.symbols:
+            m = f.markets.get(sym) if f else None
+            if sym in self.paused:
+                out[sym] = "stopped (human)"
+            elif fresh and sym in self.agent_applied.agent_paused:  # type: ignore[union-attr]
+                out[sym] = "paused (agent)"
+            elif (
+                fresh
+                and self.agent_applied.active_markets is not None  # type: ignore[union-attr]
+                and sym not in self.agent_applied.active_markets  # type: ignore[union-attr]
+            ):
+                out[sym] = "not active (agent)"
+            elif m is None or m.book_issue:
+                out[sym] = f"book issue: {m.book_issue if m else 'no book'}"
+            else:
+                out[sym] = "active"
+        return out
 
     def _write_status_file(self) -> None:
         path = self.settings.cfg.path("data/engine_status.json")
@@ -1361,6 +1392,17 @@ class Engine:
             return {"ok": True, "resumed": True}
         if cmd == "ping":
             return {"ok": True, "mode": self.mode.value}
+        if cmd == "start_markets":
+            # Inverse of `stop <market>`: clear the human pause. Same mode only (the CLI asks the
+            # human-in-the-loop questions first for trade); never changes mode or limits.
+            if req.get("mode") != self.mode.value:
+                return {"ok": False, "error": f"engine runs in {self.mode.value} mode"}
+            unknown = sorted(markets - set(self.symbols))
+            if unknown:
+                return {"ok": False, "error": f"not in this engine's universe: {unknown}"}
+            self.paused -= markets
+            log_event(self.conn, "control.start_markets", {"markets": sorted(markets)})
+            return {"ok": True, "started": sorted(markets), "paused": sorted(self.paused)}
         if cmd == "status":
             return {"ok": True, "status": self.snapshot()}
         if cmd == "stop":
@@ -1485,7 +1527,13 @@ class Engine:
         sock = self.settings.cfg.path(ecfg.socket_path)
         try:
             # Health first: the platform must see the port while startup (sync, preflight) runs.
-            servers.append(await health.serve(ecfg.health_port, self.health))
+            api = ReadOnlyApi(
+                self.settings.cfg.path(self.settings.cfg.store.db_path),
+                self._api_status,
+                float(self.settings.cfg.account.expected_equity_tmn),
+                float(self.settings.cfg.paper.capital_tmn),
+            )
+            servers.append(await health.serve(ecfg.health_port, self.health, api))
             await self.startup()
             servers.append(await control.serve(sock, self.handle))
             tasks = [

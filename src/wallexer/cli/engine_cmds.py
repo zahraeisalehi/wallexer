@@ -14,13 +14,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from wallexer.cli.theme import bps, mode_badge, pct, table, tmn
 from wallexer.config import Mode, Settings
 from wallexer.engine import control
 from wallexer.store.db import init_db, log_event, now_iso
 
 NOT_RUNNING = (
-    "The engine is not running. Start it with `wallexer shadowtest` (shadow, detached) "
-    "or `wallexer engine run --mode shadow` (foreground)."
+    "[warn]The engine is not running.[/] Start it with `wallexer shadowtest` (simulated orders) "
+    "or `wallexer trade` (live). Watching the server instead? `wallexer --remote status`."
 )
 
 
@@ -83,32 +84,60 @@ def get_status(settings: Settings) -> tuple[dict[str, Any] | None, bool]:
     return None, False
 
 
-def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
+def render_status(st: dict[str, Any], live: bool, console: Console, origin: str = "LOCAL") -> None:
+    if st.get("starting"):
+        console.print(
+            Panel(
+                f"{mode_badge(st.get('mode'))}  engine starting (preflight, history sync)… · {origin}",
+                expand=False,
+            )
+        )
+        return
     shadow = st.get("mode") == "shadow"
-    banner = "SHADOW (simulated orders)" if shadow else "TRADE (LIVE ORDERS)"
-    style = "bold black on yellow" if shadow else "bold white on red"
+    banner = (
+        "[shadow] SHADOW · simulated orders [/]" if shadow else "[live] TRADE · LIVE ORDERS [/]"
+    )
     age = (
         ""
         if live
-        else f" · engine not running, last status from file ({_ago(st.get('written_at'))})"
+        else f" · [warn]engine not running, last status from file ({_ago(st.get('written_at'))})[/]"
     )
+    where = "" if origin == "LOCAL" else f" · [head]REMOTE[/] {origin}"
     console.print(
         Panel(
-            f"[{style}] {banner} [/]  run {st.get('run_id')} · uptime {st.get('uptime_s')}s{age}",
+            f"{banner}  run {st.get('run_id')} · uptime {_uptime(st.get('uptime_s'))}{where}{age}",
             expand=False,
         )
     )
 
-    t = Table(show_header=False, box=None)
-    t.add_row("Equity", f"{int(st['equity_tmn']):,} TMN", "PnL vs 5M", f"{st['pnl_pct_vs_start']}%")
-    t.add_row("Drawdown", f"{st['drawdown_pct']}%", "Exposure", f"{int(st['exposure_tmn']):,} TMN")
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column(style="muted")
+    t.add_column(justify="right")
+    t.add_column(style="muted")
+    t.add_column(justify="right")
+    pnl = st["pnl_pct_vs_start"]
+    pnl_style = "ok" if not str(pnl).startswith("-") else "err"
+    t.add_row(
+        "Equity", f"{tmn(st['equity_tmn'])} TMN", "PnL vs 5M", f"[{pnl_style}]{pct(pnl, 3)}[/]"
+    )
+    t.add_row(
+        "Drawdown",
+        pct(st["drawdown_pct"], 3, signed=False),
+        "Exposure",
+        f"{tmn(st['exposure_tmn'])} TMN",
+    )
     t.add_row(
         "Phase",
         f"{st['phase']}",
         "Open orders",
         str(st["open_orders"]),
     )
-    t.add_row("Hard stop", str(st["hard_stopped"]), "Soft stop", str(st["soft_stop_active"]))
+    t.add_row(
+        "Hard stop",
+        "[err]ACTIVE[/]" if st["hard_stopped"] else "[ok]off[/]",
+        "Soft stop",
+        "[warn]active[/]" if st["soft_stop_active"] else "[ok]off[/]",
+    )
     usdt = st.get("usdt_inventory", {})
     t.add_row(
         "USDT inventory",
@@ -119,13 +148,12 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     console.print(t)
     sch = st.get("schedule") or {}
     if sch.get("end"):
-        console.print(
-            f"[bold]Schedule[/]: entries stop {sch['entries_stop']} · flatten {sch['flatten_from']} · end {sch['end']}"
-        )
+        console.print(f"[key]Schedule[/]: {schedule_line(sch)}")
     else:
-        console.print("[yellow]Schedule: EVENT_END_UTC not set: no entry stop, no auto-flatten[/]")
+        console.print("[warn]Schedule: EVENT_END_UTC not set: no entry stop, no auto-flatten[/]")
     if st.get("flat_by_design"):
-        console.print("[bold cyan]flat by design: no strategy has proven edge yet[/]")
+        console.print("[head]flat by design: no strategy has proven edge yet[/]")
+    render_market_states(st.get("market_states") or {}, console)
 
     wf = st.get("walk_forward") or {}
     age = wf.get("age_h")
@@ -136,7 +164,8 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     )
     s = Table(
         title=f"Strategies (promotion needs walk-forward OOS AND shadow · {age_txt})",
-        header_style="bold cyan",
+        header_style="head",
+        title_justify="left",
     )
     for col in (
         "Strategy",
@@ -153,15 +182,15 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
     for x in st["strategies"]:
         bt, sh = x.get("oos", {}), x.get("shadow", {})
         status = x["status"]
-        color = "green" if x["promoted"] else ("magenta" if x["paper_only"] else "white")
+        color = "ok" if x["promoted"] else "muted"
         s.add_row(
             x["name"],
-            f"[{color}]{status}[/]",
+            f"[{color}]{status.split(':')[0]}[/]",
             f"{x.get('timeframe')}m",
             x["weight"],
             f"{bt.get('n')} / {bt.get('net_tmn')} / {bt.get('pf')}" if bt else "– (no selection)",
             f"{sh.get('n')} / {sh.get('net_tmn')} / {sh.get('pf')}",
-            x["paper_equity"],
+            tmn(x["paper_equity"]),
             ", ".join(x["open_paper_positions"] + [f"{p}(maker)" for p in x["pending_maker"]])
             or "–",
             x["reason"],
@@ -170,29 +199,33 @@ def render_status(st: dict[str, Any], live: bool, console: Console) -> None:
 
     render_agent(st.get("agent") or {}, console)
 
-    fd = Table(
-        title=f"Feed ({st.get('depth_source')}, every {st.get('depth_interval_s')}s, rate-limit remaining {st.get('ratelimit_remaining')})",
-        header_style="bold cyan",
+    fd = table(
+        f"Feed ({st.get('depth_source')}, every {st.get('depth_interval_s')}s, rate-limit remaining {st.get('ratelimit_remaining')})",
+        [
+            ("Market", "text"),
+            ("Spread bps", "num"),
+            ("Taker", "num"),
+            ("Round trip bps", "num"),
+            ("Book", "text"),
+        ],
     )
-    for col in ("Market", "Spread bps", "Taker", "Round trip bps", "Book"):
-        fd.add_column(col)
     for sym, v in st.get("feed", {}).items():
         fd.add_row(
             sym,
-            v["spread_bps"],
+            bps(v["spread_bps"]),
             v["taker"],
-            v["rt_bps"],
-            f"[red]{v['issue']}[/]" if v["issue"] else "ok",
+            bps(v["rt_bps"]),
+            f"[warn]{v['issue']}[/]" if v["issue"] else "[ok]ok[/]",
         )
     console.print(fd)
     rg = st.get("regime") or {}
     console.print(
-        f"[dim]regime (percentiles vs 30d history): {rg} · allocation: {st.get('allocation_source')} · errors: {st.get('errors')}\n"
+        f"[muted]regime (percentiles vs 30d history): {rg} · allocation: {st.get('allocation_source')} · errors: {st.get('errors')}\n"
         f"walk-forward: grid {wf.get('grid_size')}, split {wf.get('split')}, report {wf.get('report')} · package: {st.get('package')}\n"
         f"events: {st.get('events')}\npreflight: {st.get('preflight')}[/]"
     )
     if st.get("dust"):
-        console.print(f"[dim]dust accepted: {st['dust']}[/]")
+        console.print(f"[muted]dust accepted: {st['dust']}[/]")
 
 
 def render_agent(ag: dict[str, Any], console: Console) -> None:
@@ -242,21 +275,86 @@ def _ago(ts: Any) -> str:
         return "unknown"
 
 
-def human_in_the_loop(settings: Settings, console: Console) -> bool:
-    """cli-spec: before trade, always ask about backtest + shadow; show latest results; log answer."""
-    st, live = get_status(settings)
-    if st:
-        console.print("[bold]Latest results:[/]")
-        render_status(st, live, console)
-    else:
-        console.print("[yellow]No backtest/shadow results found yet.[/]")
-    ans = console.input("Run/review backtest and shadowtest first? \\[Y/n] ").strip().lower()
-    review_first = ans in ("", "y", "yes")
+def schedule_line(sch: dict[str, Any]) -> str:
+    if not sch or not sch.get("end"):
+        return "[warn]EVENT_END_UTC not set[/]"
+    return f"entries stop {sch['entries_stop']} · flatten {sch['flatten_from']} · end {sch['end']}"
+
+
+def _uptime(s: Any) -> str:
+    try:
+        s = int(s)
+    except (TypeError, ValueError):
+        return "–"
+    h, rem = divmod(s, 3600)
+    return f"{h}h {rem // 60:02d}m" if h else f"{rem // 60}m {rem % 60:02d}s"
+
+
+STATE_STYLE = {
+    "active": "ok",
+    "stopped (human)": "warn",
+    "paused (agent)": "warn",
+    "not active (agent)": "muted",
+}
+
+
+def render_market_states(states: dict[str, str], console: Console) -> None:
+    """Per-market scope: each market can be stopped/started on its own (`stop m`, `trade m`)."""
+    if not states:
+        return
+    by: dict[str, list[str]] = {}
+    for sym, state in states.items():
+        by.setdefault(state, []).append(sym)
+    parts = [
+        f"[{STATE_STYLE.get(state, 'err')}]{state}[/] {', '.join(syms)}"
+        for state, syms in by.items()
+    ]
+    console.print("[key]Markets[/]: " + " · ".join(parts))
+
+
+def _log(settings: Settings, kind: str, payload: dict[str, Any]) -> None:
     conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
-    log_event(
-        conn,
+    try:
+        log_event(conn, kind, {**payload, "ts": now_iso()})
+    finally:
+        conn.close()
+
+
+def show_latest_results(settings: Settings, console: Console) -> None:
+    """The latest backtest verdicts and shadow summary, shown before every trade start."""
+    from wallexer.cli import source, views
+
+    bt = source.rslt(settings, "backtest")
+    sh = source.rslt(settings, "shadowtest")
+    console.rule("[head]Latest backtest[/]", align="left")
+    views.render_rslt_backtest(bt, console)
+    console.rule("[head]Latest shadowtest[/]", align="left")
+    views.render_rslt_shadow(sh, console)
+    console.rule()
+
+
+def confirm_trade(settings: Settings, console: Console, context: str) -> bool:
+    """Human in the loop before ANY live start (cli-spec): always ask about backtest + shadowtest,
+    show the latest results, then require typing TRADE. Both answers are logged. True = go."""
+    show_latest_results(settings, console)
+    ans = console.input("Run/review backtest and shadowtest first? \\[Y/n] ").strip().lower()
+    review_first = ans not in ("n", "no")
+    _log(
+        settings,
         "cli.trade_hitl_prompt",
-        {"answer": ans or "Y(default)", "review_first": review_first, "ts": now_iso()},
+        {"context": context, "answer": ans or "Y(default)", "review_first": review_first},
     )
-    conn.close()
-    return not review_first
+    if review_first:
+        console.print(
+            "OK: review first. Nothing started. `wallexer backtest`, `wallexer shadowtest`,"
+            " `wallexer rslt shadowtest`."
+        )
+        return False
+    typed = console.input(
+        f"[err]This places REAL orders ({context}).[/] Type TRADE to confirm: "
+    ).strip()
+    confirmed = typed == "TRADE"
+    _log(settings, "cli.trade_confirm", {"context": context, "confirmed": confirmed})
+    if not confirmed:
+        console.print("Not confirmed. Nothing started.")
+    return confirmed

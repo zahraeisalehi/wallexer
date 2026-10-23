@@ -39,7 +39,7 @@ def _stop_engine(settings: Settings, console: Console, flatten_first: bool) -> b
             if not engine_running(settings):
                 return True
             time.sleep(1)
-    console.print("[red]Engine did not stop in time.[/]")
+    console.print("[err]Engine did not stop in time.[/]")
     return False
 
 
@@ -54,18 +54,25 @@ def _ask_keep_or_flatten(console: Console) -> bool:
 
 async def change(settings: Settings, console: Console, src: str, dst: str) -> int:
     from wallexer.cli.backtest_cmds import run_walk_forward
-    from wallexer.cli.engine_cmds import human_in_the_loop, spawn, wait_ready
+    from wallexer.cli.engine_cmds import confirm_trade, spawn, wait_ready
 
     if src not in MODES or dst not in MODES or src == dst:
-        console.print(f"[red]usage:[/] wallexer change <from> <to> with from ≠ to in {MODES}")
+        console.print(
+            f"[err]error:[/] unknown transition {src} → {dst}\n"
+            f"[muted]usage: wallexer change <from> <to>, from ≠ to, each one of {', '.join(MODES)}\n"
+            "example: wallexer change shadowtest trade[/]"
+        )
         return 2
     running = _running_mode(settings)
     if src in ("shadowtest", "trade") and running != src:
-        console.print(f"[red]Engine is not running in {src}[/] (running: {running or 'nothing'}).")
+        console.print(
+            f"[err]The engine is not running in {src}[/] (running: {running or 'nothing'})."
+            + (f" Try `wallexer change {running} {dst}`." if running and running != dst else "")
+        )
         return 1
     if src == "backtest" and running:
         console.print(
-            f"[red]An engine is running in {running}.[/] Use `wallexer change {running} {dst}`."
+            f"[err]An engine is running in {running}.[/] Use `wallexer change {running} {dst}`."
         )
         return 1
 
@@ -79,14 +86,7 @@ async def change(settings: Settings, console: Console, src: str, dst: str) -> in
             if not ok:
                 console.print("Cancelled.")
                 return 1
-        if not human_in_the_loop(settings, console):
-            console.print("OK: review first. Nothing changed.")
-            return 0
-        if (
-            console.input("[bold red]This places REAL orders.[/] Type TRADE to start: ").strip()
-            != "TRADE"
-        ):
-            console.print("Not confirmed. Nothing changed.")
+        if not confirm_trade(settings, console, f"change {src} trade"):
             return 1
 
     # 1) leave the current mode (trade asks keep/flatten, default flatten)
@@ -106,5 +106,7 @@ async def change(settings: Settings, console: Console, src: str, dst: str) -> in
             f"[green]{dst} running[/] (pid {pid}), using the latest walk-forward selection."
         )
         return 0
-    console.print(f"[red]Engine did not come up.[/] See {settings.cfg.engine.log_path}.")
+    console.print(
+        f"[err]Engine did not come up.[/] See {settings.cfg.path(settings.cfg.engine.log_path)}."
+    )
     return 1

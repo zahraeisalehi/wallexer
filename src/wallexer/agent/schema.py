@@ -118,3 +118,36 @@ def explanation_schema() -> dict[str, Any]:
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         },
     }
+
+
+class DailySummary(BaseModel):
+    """`sum [date]` fixed output format."""
+
+    model_config = ConfigDict(extra="forbid")
+    what_the_market_did: str
+    what_the_agent_decided_and_why: str
+    what_would_change_its_mind: str
+    confidence: Literal["low", "medium", "high"]
+    cited_decision_ids: list[int]
+
+
+def daily_summary_schema() -> dict[str, Any]:
+    s = {"type": "string"}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "what_the_market_did",
+            "what_the_agent_decided_and_why",
+            "what_would_change_its_mind",
+            "confidence",
+            "cited_decision_ids",
+        ],
+        "properties": {
+            "what_the_market_did": s,
+            "what_the_agent_decided_and_why": s,
+            "what_would_change_its_mind": s,
+            "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+            "cited_decision_ids": {"type": "array", "items": {"type": "integer"}},
+        },
+    }

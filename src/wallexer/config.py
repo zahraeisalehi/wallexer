@@ -1,12 +1,21 @@
 """Configuration: TOML tunables + env secrets.
 
-Layering (later wins): config/default.toml < data/overrides.toml < environment / .env.
-data/overrides.toml holds values the engine learns at runtime (e.g. the real min order value),
-so the checked-in defaults are never rewritten by the bot.
+Layering (later wins): config/default.toml < user config.toml < data/overrides.toml < environment
+/ .env. data/overrides.toml holds values the engine learns at runtime (e.g. the real min order
+value), so the checked-in defaults are never rewritten by the bot.
+
+Two layouts:
+- development (a repo checkout, also the Docker image): everything relative to the repo root,
+  secrets in ./.env, exactly as before.
+- installed (`uv tool install`): defaults ship inside the package; settings + credentials live in
+  the user's config dir, the DB/logs/reports in the user's data dir (platformdirs).
+`WALLEXER_HOME` overrides the data dir (and the config dir) in either layout.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import tomllib
 from datetime import datetime
 from decimal import Decimal
@@ -18,7 +27,62 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = ROOT / "config" / "default.toml"
+_RESOURCES = Path(__file__).resolve().parent / "_resources"
+DEV = (ROOT / "config" / "default.toml").exists()
+DEFAULT_CONFIG = ROOT / "config" / "default.toml" if DEV else _RESOURCES / "default.toml"
+
+
+def _home_override() -> Path | None:
+    h = os.environ.get("WALLEXER_HOME")
+    return Path(h).expanduser() if h else None
+
+
+def data_home() -> Path:
+    """Base for every relative path in the config (DB, logs, socket, overrides, lists)."""
+    h = _home_override()
+    if h:
+        return h
+    if DEV:
+        return ROOT
+    import platformdirs
+
+    return Path(platformdirs.user_data_dir("wallexer", appauthor=False))
+
+
+def config_home() -> Path:
+    h = _home_override()
+    if h:
+        return h
+    if DEV:
+        return ROOT
+    import platformdirs
+
+    return Path(platformdirs.user_config_dir("wallexer", appauthor=False))
+
+
+def user_config_path() -> Path:
+    """Written by `wallexer setup` (mode, remote url). Not used in a dev checkout."""
+    return config_home() / "config.toml"
+
+
+def credentials_path() -> Path:
+    """dev: ./.env; installed: <config dir>/credentials.env (0600, written by `wallexer setup`)."""
+    if DEV and _home_override() is None:
+        return ROOT / ".env"
+    return config_home() / "credentials.env"
+
+
+def _seed_data_home() -> None:
+    """Installed layout: copy the shipped market lists once (filtered again in the risk gate)."""
+    if DEV and _home_override() is None:
+        return
+    data = data_home() / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    src_dir = ROOT / "data" if DEV else _RESOURCES
+    for name in ("not_allowed.txt", "unavailable_markets.txt"):
+        dst, src = data / name, src_dir / name
+        if not dst.exists() and src.exists():
+            shutil.copyfile(src, dst)
 
 
 class ConfigError(Exception):
@@ -225,6 +289,12 @@ class AllocCfg(BaseModel):
     usdt_breakeven_trades_per_cycle: Decimal = Decimal("2")
 
 
+class RemoteCfg(BaseModel):
+    # `wallexer --remote` (or default=true) reads status/log/reason/rslt from this server's API.
+    url: str = ""
+    default: bool = False
+
+
 class StoreCfg(BaseModel):
     db_path: str = "data/wallexer.db"
     overrides_path: str = "data/overrides.toml"
@@ -247,17 +317,19 @@ class AppConfig(BaseModel):
     alloc: AllocCfg = AllocCfg()
     backtest: BacktestCfg = BacktestCfg()
     agent: AgentCfg = AgentCfg()
+    remote: RemoteCfg = RemoteCfg()
 
     def path(self, rel: str) -> Path:
-        """Resolve a config-relative path against the repo root."""
+        """Resolve a config-relative path against the data home (the repo root in development)."""
         p = Path(rel)
-        return p if p.is_absolute() else ROOT / p
+        return p if p.is_absolute() else data_home() / p
 
 
 class Secrets(BaseSettings):
     """Env / .env values. Keys are SecretStr so they never show up in logs or reprs."""
 
-    model_config = SettingsConfigDict(env_file=ROOT / ".env", extra="ignore")
+    # env_file is passed at load time (see load_settings): ./.env or the user credentials file.
+    model_config = SettingsConfigDict(extra="ignore")
 
     wallex_api_key: SecretStr | None = None
     # Required for any private call: the trading-credit (sub) account id.
@@ -265,6 +337,10 @@ class Secrets(BaseSettings):
     boxapi_api_key: SecretStr | None = None
     wallexer_mode: Mode = Mode.shadow
     event_end_utc: datetime | None = None
+    # Read-only remote viewing: the CLI sends it; the engine's /api/* accepts only this token.
+    wallexer_view_token: SecretStr | None = None
+    # Fallback for [remote] url (handy in a dev checkout's .env).
+    wallexer_remote_url: str | None = None
 
 
 def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -320,11 +396,15 @@ class Settings(BaseModel):
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
+    _seed_data_home()
     raw = _read_toml(config_path or DEFAULT_CONFIG)
-    base = AppConfig.model_validate(raw)
-    overrides = _read_toml(base.path(base.store.overrides_path))
+    if not DEV or _home_override() is not None:
+        raw = _deep_merge(raw, _read_toml(user_config_path()))
     try:
+        base = AppConfig.model_validate(raw)
+        overrides = _read_toml(base.path(base.store.overrides_path))
         cfg = AppConfig.model_validate(_deep_merge(raw, overrides))
-        return Settings(cfg=cfg, secrets=Secrets())
+        cred = credentials_path()
+        return Settings(cfg=cfg, secrets=Secrets(_env_file=cred if cred.exists() else None))
     except ValueError as e:
         raise ConfigError(f"Invalid configuration: {e}") from e

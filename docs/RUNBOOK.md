@@ -43,6 +43,22 @@ liara shell -a wallexer --team-id $T -c "wallexer rslt shadowtest"
 Healthy: `/health` → `"ok": true`, `status` shows the mode banner, `errors: 0`, feed books "ok",
 agent stance + rationale (first decision ~90 s after start).
 
+### Remote viewing (read-only API, replaces `liara shell` for looking)
+The engine serves `/api/status`, `/api/log?n=&after=`, `/api/reason[/{id}]`, `/api/rslt/{backtest|shadowtest}`,
+`/api/equity`, `/api/sum?date=` next to `/health`. GET only (anything else → 405), header
+`X-View-Token` must equal the env var `WALLEXER_VIEW_TOKEN` (unset → the API does not exist, 404),
+DB opened read-only. There are no write endpoints: stop/flatten/resume still need `liara shell`.
+```
+# once, yourself (the value never goes into git or chat); this restarts the app:
+liara env set -a wallexer --team-id $T WALLEXER_VIEW_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+# on your laptop:
+wallexer setup --mode remote        # URL https://wallexer.liara.run + the same token (hidden prompt, stored 0600)
+wallexer status · wallexer watch · wallexer log · wallexer reason 12 · wallexer rslt shadowtest · wallexer sum
+```
+In a dev checkout instead: `WALLEXER_REMOTE_URL=https://wallexer.liara.run` + `WALLEXER_VIEW_TOKEN=...`
+in `.env`, then `wallexer --remote status`. In remote mode trade/stop/flatten/change/resume/config/
+autoset/shadowtest/engine/agent/doctor --live-smoke are refused before any request is made.
+
 ## 3. Switch shadow → trade (only after the smoke test passed and you said so)
 ```
 liara env set -a wallexer --team-id $T WALLEXER_MODE=trade   # restarts the app
