@@ -85,6 +85,16 @@ script refuses that) means:
 - `config/demo.toml` is layered on top: depth every 15 s, trades 60 s, candles 180 s, feed budget 15 %
   of the rate limit, 6 markets, 10 days of history (strategy/risk/allocation settings unchanged);
 - `/health` and `/api/status` report `"demo": true`.
+
+`WALLEXER_VIEW_PUBLIC=1` (demo only; the engine refuses to start with it unless `WALLEXER_DEMO=1`)
+makes the read-only `/api/*` answer without a token, so a fresh install watches the demo with zero
+setup. Still GET-only on the read-only DB. The demo engine pre-generates the LLM answers it shows
+(today's `sum` hourly, yesterday's once, `exp-reason` for each new agent decision, with the demo's
+BoxAPI key) and `/api/sum`, `/api/explain[/{id}]` only read them: no request can trigger an LLM call.
+`deploy/deploy-demo.sh` refuses unless it is set:
+```
+liara env set -a wallexer-demo --team-id $T WALLEXER_VIEW_PUBLIC=1
+```
 ```
 curl -s https://wallexer-demo.liara.run/health                               # mode shadow, demo true
 curl -s -H "X-View-Token: $TOKEN" https://wallexer-demo.liara.run/api/status  # 200

@@ -38,11 +38,13 @@ def _read_env(path: Path) -> dict[str, str]:
     return out
 
 
-def write_credentials(values: dict[str, str]) -> Path:
-    """Merge into the credentials file; created 0600 before anything is written to it."""
+def write_credentials(values: dict[str, str], drop: tuple[str, ...] = ()) -> Path:
+    """Merge into the credentials file; created 0600 before anything is written to it.
+    `drop` removes keys (e.g. an old view token when the server is public)."""
     path = credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    merged = _read_env(path) | {k: v for k, v in values.items() if v}
+    merged = {k: v for k, v in _read_env(path).items() if k not in drop}
+    merged |= {k: v for k, v in values.items() if v}
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("# wallexer credentials (written by `wallexer setup`; keep private)\n")
@@ -99,7 +101,7 @@ def _check_remote(console: Console, url: str, token: str) -> bool:
     from wallexer.cli.source import Remote, RemoteError, api_get
 
     try:
-        st = api_get(Remote(url, token), "/api/status", timeout=10) or {}
+        st = api_get(Remote(url, token.strip()), "/api/status", timeout=10) or {}
     except RemoteError as e:
         console.print(f"[err]remote check failed:[/] {e}")
         return False
@@ -151,11 +153,24 @@ def run_setup(console: Console, choice: str | None = None) -> bool:
         url = console.input("Server URL (e.g. https://wallexer.liara.run): ").strip().rstrip("/")
         if not url.startswith(("http://", "https://")):
             console.print("[warn]the URL must start with http:// or https://[/]")
-    token = _secret(console, "View token (WALLEXER_VIEW_TOKEN on the server)", True)
-    path = write_credentials({"WALLEXER_VIEW_TOKEN": token})
+    # Check the token against the server before saving it (a mistyped hidden paste was saved
+    # silently before); up to three tries, Enter = a public demo server (no token).
+    for _ in range(3):
+        token = _secret(
+            console, "View token (WALLEXER_VIEW_TOKEN on the server; Enter if public)", False
+        )
+        ok = _check_remote(console, url, token)
+        if ok:
+            break
+    if not ok:
+        console.print("[err]not saved[/]: the server did not accept it · `wallexer setup` again")
+        return False
+    path = write_credentials(
+        {"WALLEXER_VIEW_TOKEN": token}, drop=() if token else ("WALLEXER_VIEW_TOKEN",)
+    )
     write_user_config(url, True)
-    console.print(f"[ok]saved[/] {user_config_path()} and the token to {path} (mode 600, hidden).")
-    ok = _check_remote(console, url, token)
+    saved = f" and the token to {path} (mode 600, hidden)" if token else ""
+    console.print(f"[ok]saved[/] {user_config_path()}{saved}.")
     console.print(
         "Next: `wallexer status`, `wallexer watch`, `wallexer sum`. Trading commands are disabled in remote mode."
     )

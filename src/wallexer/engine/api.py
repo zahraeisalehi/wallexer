@@ -9,6 +9,11 @@ Safety:
   connection, so even a bug in a query cannot change state.
 - Auth: header `X-View-Token` must equal env WALLEXER_VIEW_TOKEN (constant-time compare). With the
   variable unset the API does not exist (404): it is never open by accident.
+- Public view (demo only): WALLEXER_VIEW_PUBLIC=1 *and* WALLEXER_DEMO=1 drop the token check, so a
+  fresh install can watch the demo with zero setup. Still GET-only, still the read-only DB. Without
+  WALLEXER_DEMO=1 the flag is ignored here, and the engine refuses to start (engine/daemon.py).
+- LLM answers (sum, explain) are only read here; the demo engine pre-generates them, so no request
+  can trigger an LLM call.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from wallexer.cli import views
+from wallexer.config import is_demo, is_view_public
 
 TOKEN_ENV = "WALLEXER_VIEW_TOKEN"
 MAX_ROWS = 2000
@@ -52,12 +58,13 @@ class ReadOnlyApi:
         self, method: str, target: str, headers: dict[str, str]
     ) -> tuple[int, dict[str, Any]]:
         token = os.environ.get(TOKEN_ENV, "")
-        if not token:
+        public = is_view_public() and is_demo()
+        if not token and not public:
             return 404, {"error": "not found"}
         if method != "GET":
             return 405, {"error": "read-only API: GET only"}
         given = headers.get("x-view-token", "")
-        if not hmac.compare_digest(given.encode(), token.encode()):
+        if not public and not hmac.compare_digest(given.encode(), token.encode()):
             return 401, {"error": "missing or wrong X-View-Token"}
         url = urlsplit(target)
         parts = [p for p in url.path.split("/") if p][1:]  # drop "api"
@@ -71,6 +78,25 @@ class ReadOnlyApi:
             return 400, {"error": "bad parameter"}
         except sqlite3.Error as e:
             return 503, {"error": f"database unavailable: {str(e)[:80]}"}
+
+    def _explain(self, conn: sqlite3.Connection, n: int | None) -> tuple[int, dict[str, Any]]:
+        try:
+            row = conn.execute(
+                "SELECT * FROM explanations WHERE decision_id=?"
+                if n is not None
+                else "SELECT * FROM explanations ORDER BY decision_id DESC LIMIT 1",
+                (n,) if n is not None else (),
+            ).fetchone()
+        except sqlite3.OperationalError:  # DB from before the table existed
+            row = None
+        if row is None:
+            return 404, {"error": "not generated yet"}
+        return 200, {
+            "decision_id": row["decision_id"],
+            "created_at": row["created_at"],
+            "explanation": json.loads(row["explanation"]),
+            "llm_call_id": row["llm_call_id"],
+        }
 
     def _db_route(self, parts: list[str], q: dict[str, str]) -> tuple[int, dict[str, Any]]:
         conn = self._connect()
@@ -99,6 +125,8 @@ class ReadOnlyApi:
                     "facts": daily.daily_facts(conn, day),
                     "explanation": json.loads(cached[0]) if cached and cached[0] else None,
                 }
+            if parts and parts[0] == "explain" and len(parts) <= 2:
+                return self._explain(conn, int(parts[1]) if len(parts) == 2 else None)
             if len(parts) == 2 and parts[0] == "reason":
                 d = views.reason_data(conn, int(parts[1]))
                 return (200, d) if d else (404, {"error": "no such decision"})

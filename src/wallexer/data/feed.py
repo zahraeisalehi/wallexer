@@ -4,10 +4,14 @@
   /v1/depth per market. Trades every 10 s, candles every 60 s.
 - Rate budget: the market-data limit is 600 requests per 39 s window (user-confirmed). Intervals
   are stretched at startup so planned calls stay under `feed_budget_frac` of it.
-- Book health: crossed/locked (bid >= ask), stale (no fresh fetch for 3 intervals, or the book
-  unchanged for frozen_book_s AND >= FROZEN_MIN_TRADES trades printed in that window; one or two
-  prints at the touch can legitimately leave the top unchanged). Unhealthy books -> no signals +
-  an event (rate-limited per market and issue).
+- Book health: crossed/locked (bid >= ask), stale (no fresh fetch for 3 intervals, or "frozen":
+  the top unchanged for at least FROZEN_MIN_POLLS consecutive polls and max(frozen_book_s,
+  FROZEN_MIN_POLLS x depth interval), AND >= FROZEN_MIN_TRADES trades printed *after* the last
+  change; one or two prints at the touch can legitimately leave the top unchanged). Prints are
+  matched by their exchange timestamp, not by when we polled them: a trades poll returns the last
+  50 prints (an hour or more on a quiet market), so counting by poll time flagged quiet books as
+  frozen under slow polling. Unhealthy books -> no signals + an event (rate-limited per market and
+  issue).
 - Candles: 1-min bars live (seeded from the stored history), resampled to 5/15-min on change;
   60-min bars are native and polled every 5 minutes.
 """
@@ -17,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from datetime import datetime
 from decimal import Decimal
 
 import structlog
@@ -34,8 +39,17 @@ log = structlog.get_logger(__name__)
 WINDOW_BARS = 130  # features look back this many bars on any timeframe
 MAX_BARS = WINDOW_BARS * 15 + 60  # enough 1-min bars to resample 130 15-min bars
 FROZEN_MIN_TRADES = 3
+FROZEN_MIN_POLLS = 5
 H60_POLL_S = 300
 EVENT_EVERY_S = 60.0
+
+
+def _trade_ts(t: Trade) -> float:
+    """Exchange time of a print (ISO, e.g. 2026-10-23T13:01:09Z); 0 if unparseable (not counted)."""
+    try:
+        return datetime.fromisoformat(t.timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 class MarketFeed:
@@ -54,6 +68,7 @@ class MarketFeed:
         self.book_ts: dict[str, float] = {}
         self._book_sig: dict[str, tuple[str, float]] = {}  # signature, last change ts
         self._trades_since_change: dict[str, int] = {}
+        self._unchanged_polls: dict[str, int] = {}
         self.bars: dict[str, list[Bar]] = {s: [] for s in symbols}  # 1-min
         self.bars60: dict[str, list[Bar]] = {s: [] for s in symbols}
         self._tf_cache: dict[tuple[str, int], tuple[int, list[Bar]]] = {}
@@ -118,6 +133,9 @@ class MarketFeed:
             if prev is None or prev[0] != sig:
                 self._book_sig[sym] = (sig, ts)
                 self._trades_since_change[sym] = 0
+                self._unchanged_polls[sym] = 0
+            else:
+                self._unchanged_polls[sym] = self._unchanged_polls.get(sym, 0) + 1
             bids = sorted(book.bid, key=lambda lv: lv.price, reverse=True)[:10]
             asks = sorted(book.ask, key=lambda lv: lv.price)[:10]
             repo.insert_depth_snapshot(
@@ -149,7 +167,9 @@ class MarketFeed:
                 }
             if fresh:
                 self._new_trades[sym].extend(fresh)
-                self._trades_since_change[sym] = self._trades_since_change.get(sym, 0) + len(fresh)
+                changed = self._book_sig.get(sym)
+                after = sum(1 for t in fresh if changed and _trade_ts(t) > changed[1])
+                self._trades_since_change[sym] = self._trades_since_change.get(sym, 0) + after
 
     def load_from_store(self) -> None:
         """Seed live bars from the stored history (run history sync first)."""
@@ -217,17 +237,30 @@ class MarketFeed:
         if problem is None:
             sig = self._book_sig.get(sym)
             prints = self._trades_since_change.get(sym, 0)
-            if sig and now - sig[1] > ecfg.frozen_book_s and prints >= FROZEN_MIN_TRADES:
+            window = max(ecfg.frozen_book_s, FROZEN_MIN_POLLS * self.depth_interval)
+            if (
+                sig
+                and now - sig[1] > window
+                and self._unchanged_polls.get(sym, 0) >= FROZEN_MIN_POLLS
+                and prints >= FROZEN_MIN_TRADES
+            ):
                 problem = "stale"  # book frozen while the market kept trading
         if problem is not None:
             key = (sym, problem)
             if now - self._events_at.get(key, 0.0) >= EVENT_EVERY_S:
                 self._events_at[key] = now
                 kind = "feed.book_crossed" if problem == "crossed" else f"feed.book_{problem}"
+                sig = self._book_sig.get(sym)
                 log_event(
                     self.conn,
                     kind,
-                    {"symbol": sym, "age_s": None if age is None else round(age, 1)},
+                    {
+                        "symbol": sym,
+                        "age_s": None if age is None else round(age, 1),
+                        # how long the top has not changed, and prints since (frozen check)
+                        "unchanged_s": None if not sig else round(now - sig[1], 1),
+                        "prints_since_change": self._trades_since_change.get(sym, 0),
+                    },
                 )
         return problem
 

@@ -45,25 +45,35 @@ def banner(console: Console) -> None:
         if origin.startswith("REMOTE")
         else "[head]LOCAL[/]"
     )
+    is_remote = origin.startswith("REMOTE")
+    err = None
     try:
         st, live, _o = source.status(settings)
     except (source.RemoteError, ConfigError) as e:
-        st, live = None, False
-        where += f" · [err]{e}[/]"
+        st, live, err = None, False, str(e)
     g = settings.cfg.guardrails
     end = settings.secrets.event_end_utc
-    sch = (st or {}).get("schedule") or times(
-        end.timestamp() if end else None, g.flatten_no_entry_min * 60, g.flatten_force_min * 60
+    # Remote: mode, equity and the schedule come from the server only, never local env/DB.
+    sch = (st or {}).get("schedule") or (
+        None
+        if is_remote
+        else times(
+            end.timestamp() if end else None, g.flatten_no_entry_min * 60, g.flatten_force_min * 60
+        )
     )
-    if st and live and not st.get("starting"):
+    if err:
+        engine = f"[err]unreachable:[/] {err}"
+    elif st and live and not st.get("starting"):
         pnl = st.get("pnl_pct_vs_start")
         style = "err" if str(pnl).startswith("-") else "ok"
         engine = (
-            f"{mode_badge(st.get('mode'))} run {st.get('run_id')} · equity {tmn(st.get('equity_tmn'))} TMN · "
+            f"{'[demo] DEMO [/] ' if st.get('demo') else ''}{mode_badge(st.get('mode'))} run {st.get('run_id')} · equity {tmn(st.get('equity_tmn'))} TMN · "
             f"PnL [{style}]{pct(pnl, 3)}[/] · open orders {st.get('open_orders')}"
         )
     elif st and st.get("starting"):
         engine = f"{mode_badge(st.get('mode'))} starting…"
+    elif is_remote:
+        engine = "[muted]server answered without an engine status[/]"
     else:
         engine = "[muted]engine not running[/] · start one with `shadowtest` (simulated) or `trade` (live)"
     keys = (
@@ -73,7 +83,7 @@ def banner(console: Console) -> None:
     )
     console.print(
         Panel(
-            f"{where} · {engine}\n[key]Schedule[/] {schedule_line(sch)}{keys}\n"
+            f"{where} · {engine}\n[key]Schedule[/] {schedule_line(sch) if sch else '[muted]–[/]'}{keys}\n"
             "[muted]Tab completes · `help` lists commands · Ctrl-C clears the line · `exit` or Ctrl-D leaves[/]",
             title="[key]wallexer[/]",
             title_align="left",

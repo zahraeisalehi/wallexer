@@ -205,6 +205,14 @@ CREATE TABLE IF NOT EXISTS daily_summaries (
     PRIMARY KEY (date, origin)
 );
 
+-- `exp-reason` answers per decision (the demo engine pre-generates them for the public view).
+CREATE TABLE IF NOT EXISTS explanations (
+    decision_id INTEGER PRIMARY KEY REFERENCES decisions(id),
+    created_at  TEXT NOT NULL,
+    explanation TEXT NOT NULL,             -- JSON (agent/schema.py Explanation)
+    llm_call_id INTEGER REFERENCES llm_calls(id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
