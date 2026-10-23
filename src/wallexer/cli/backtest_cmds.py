@@ -99,16 +99,58 @@ def median_spreads(conn, symbols: list[str]) -> tuple[dict[str, Decimal], list[s
     return out, missing
 
 
-async def run_walk_forward(settings: Settings, console: Console) -> None:
+class BacktestInputError(ValueError):
+    """Bad --from/--to/--markets/--timeframe value (shown as a one-line error)."""
+
+
+async def run_walk_forward(
+    settings: Settings,
+    console: Console,
+    *,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    markets: list[str] | None = None,
+    timeframes: list[int] | None = None,
+) -> None:
+    """No arguments = the config values (the run the promotion gate uses). Any argument makes a
+    custom run: same walk-forward, stored as kind='walk_forward_custom', never used for promotion."""
     from wallexer.backtest import report, walkforward
     from wallexer.data.history import load_bars
     from wallexer.exchange.rules import MarketRules
 
+    custom = any(x for x in (date_from, date_to, markets, timeframes))
+    if custom:
+        settings = settings.model_copy(deep=True)
+        if timeframes:
+            settings.cfg.backtest.timeframes = sorted(set(timeframes))
     cfg = settings.cfg
+    now = int(datetime.now(UTC).timestamp())
+    oldest = now - cfg.backtest.history_days * 86400
+    lo_ts = int(date_from.timestamp()) if date_from else oldest
+    hi_ts = int(date_to.timestamp()) if date_to else now
+    if lo_ts < oldest - 86400:
+        raise BacktestInputError(
+            f"--from is older than the stored history ({cfg.backtest.history_days} days)"
+        )
+    if hi_ts - lo_ts < 3 * 86400:
+        raise BacktestInputError("the window must be at least 3 days (IS 2/3 + OOS 1/3)")
     conn = init_db(cfg.path(cfg.store.db_path))
     try:
         async with WallexClient(settings) as client:
             symbols = await universe_symbols(client, settings)
+            if markets:
+                unknown = sorted(set(markets) - set(symbols))
+                if unknown:
+                    raise BacktestInputError(
+                        f"not in the tradable universe: {', '.join(unknown)} (see `wallexer markets --all`)"
+                    )
+                symbols = sorted(set(markets))
+                # USDT markets are valued in TMN via USDTTMN: without it no USDT entry can size.
+                if any(m.endswith("USDT") for m in symbols) and "USDTTMN" not in symbols:
+                    symbols.append("USDTTMN")
+                    console.print(
+                        "[muted]added USDTTMN: USDT markets are valued in TMN through it[/]"
+                    )
             with console.status("Incremental history sync…"):
                 await sync_history(client, conn, symbols, cfg.backtest.history_days)
             fees = await client.fees()
@@ -123,23 +165,33 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
                 meta[s] = f"{spreads[s]:.2f} (live /v1/depth)"
         rules = {s: MarketRules.from_market(m) for s, m in markets.items()}
         quotes = {s: markets[s].quote_asset for s in symbols}
-        since = int(datetime.now(UTC).timestamp()) - cfg.backtest.history_days * 86400
+        since = lo_ts
         res_of = {1: "1", 5: "5", 15: "15", 60: "60"}
 
         # Bars are loaded per timeframe inside the run (memory-bounded for the 1 GB server).
         def load_tf(tf: int) -> dict[str, list]:
-            return {s: load_bars(conn, s, res_of[tf], since) for s in symbols}
+            return {s: load_bars(conn, s, res_of[tf], since, hi_ts + 1) for s in symbols}
 
         firsts, lasts = [], []
         for s in symbols:
             lo, hi = conn.execute(
-                "SELECT MIN(ts), MAX(ts) FROM candles WHERE symbol=? AND resolution='1' AND ts >= ?",
-                (s, since),
+                "SELECT MIN(ts), MAX(ts) FROM candles WHERE symbol=? AND resolution='1'"
+                " AND ts >= ? AND ts <= ?",
+                (s, since, hi_ts),
             ).fetchone()
             if lo is not None:
                 firsts.append(lo)
                 lasts.append(hi)
+        if not firsts:
+            raise BacktestInputError(
+                "no stored candles in that window: run `wallexer history sync`"
+            )
         span = (max(firsts), min(lasts))
+        if custom:
+            console.print(
+                f"[warn]custom backtest[/] {_d(span[0])} → {_d(span[1])} UTC · {len(symbols)} markets · "
+                f"timeframes {cfg.backtest.timeframes} [muted](not used by the promotion gate)[/]"
+            )
         console.print(
             f"Grid: mean_reversion {cfg.backtest.grid_mean_reversion} + momentum {cfg.backtest.grid_momentum} "
             f"× timeframes {cfg.backtest.timeframes} = [bold]{len(walkforward.grid_configs(settings))} configs[/]"
@@ -157,9 +209,12 @@ async def run_walk_forward(settings: Settings, console: Console) -> None:
                 meta,
                 progress=lambda done, total: prog.update(task, completed=done),
             )
-        path = cfg.path(f"data/reports/walkforward-{datetime.now(UTC):%Y%m%dT%H%M%S}.md")
+        tag = "walkforward-custom" if custom else "walkforward"
+        path = cfg.path(f"data/reports/{tag}-{datetime.now(UTC):%Y%m%dT%H%M%S}.md")
         path.parent.mkdir(parents=True, exist_ok=True)
-        run_id = report.persist(conn, wf, settings, path)
+        run_id = report.persist(
+            conn, wf, settings, path, kind="walk_forward_custom" if custom else "walk_forward"
+        )
         path.write_text(report.markdown(wf, settings, fees, run_id), encoding="utf-8")
         _print_rechecks(conn, wf, console)
         report.render(wf, settings, fees, console, run_id)

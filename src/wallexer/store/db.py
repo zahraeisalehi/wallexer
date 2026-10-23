@@ -193,6 +193,18 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 );
 CREATE INDEX IF NOT EXISTS ix_bt_results_run ON backtest_results(run_id, strategy);
 
+-- `sum [date]` cache: a past day is summarized once; today is regenerated. origin = LOCAL or a
+-- remote server URL (remote facts, explanation generated with the local BoxAPI key).
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    date        TEXT NOT NULL,             -- YYYY-MM-DD (UTC day)
+    origin      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    facts       TEXT NOT NULL,             -- JSON, Part 1
+    explanation TEXT,                      -- JSON, Part 2 (NULL if the LLM was unavailable)
+    llm_call_id INTEGER REFERENCES llm_calls(id),
+    PRIMARY KEY (date, origin)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,

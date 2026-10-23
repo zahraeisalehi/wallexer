@@ -48,13 +48,15 @@ def oos_gate(s: TradeStats, cfg: PromotionCfg) -> tuple[bool, str]:
     return (not problems, "; ".join(problems) or "OOS gate passed")
 
 
-def _stats_json(s: TradeStats) -> dict[str, str | int]:
+def _stats_json(s: TradeStats, trades: Any = ()) -> dict[str, str | int]:
     return {
         "n": s.n,
         "net": str(s.net),
         "gross_profit": str(s.gross_profit),
         "gross_loss": str(s.gross_loss),
         "wins": s.wins,
+        # for `rslt backtest` only; the gate reads the fields above
+        "fees": str(sum((t.fees_tmn for t in trades), ZERO)),
     }
 
 
@@ -78,12 +80,21 @@ def selected_summary(wf: WalkForward, cfg: PromotionCfg) -> dict[str, Any]:
                 "passes": False,
                 "reason": "no IS-valid config (>= min IS trades and IS PF > 1)",
             }
+            # Shown in `rslt backtest` so a failed strategy still has numbers; never promotable.
+            cands = [x for x in wf.results if x.strategy == name]
+            if cands:
+                b = max(cands, key=lambda x: (x.is_stats.net, -x.is_stats.n))
+                out[name]["best_is"] = {
+                    "config": {"timeframe": b.timeframe, "params": b.params},
+                    "is": _stats_json(b.is_stats, b.is_.trades),
+                    "oos": _stats_json(b.oos_stats, b.oos.trades),
+                }
             continue
         ok, why = oos_gate(r.oos_stats, cfg)
         out[name] = {
             "selected": {"timeframe": r.timeframe, "params": r.params},
-            "is": _stats_json(r.is_stats),
-            "oos": _stats_json(r.oos_stats),
+            "is": _stats_json(r.is_stats, r.is_.trades),
+            "oos": _stats_json(r.oos_stats, r.oos.trades),
             "passes": ok,
             "reason": why,
         }
@@ -96,8 +107,13 @@ def selected_summary(wf: WalkForward, cfg: PromotionCfg) -> dict[str, Any]:
 
 
 def persist(
-    conn: sqlite3.Connection, wf: WalkForward, settings: Settings, report_path: Path
+    conn: sqlite3.Connection,
+    wf: WalkForward,
+    settings: Settings,
+    report_path: Path,
+    kind: str = "walk_forward",
 ) -> int:
+    """kind='walk_forward_custom' for user-windowed runs: the promotion gate never reads those."""
     capital = settings.cfg.paper.capital_tmn
     summary = selected_summary(wf, settings.cfg.promotion)
     with conn:
@@ -107,7 +123,7 @@ def persist(
             " spreads, selected, report_path) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 now_iso(),
-                "walk_forward",
+                kind,
                 wf.split_ts,
                 wf.history_from,
                 wf.history_to,
