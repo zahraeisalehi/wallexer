@@ -442,7 +442,9 @@ def store_summary(
         )
 
 
-async def run_sum(settings: Settings, console: Console, arg: str | None, refresh: bool) -> int:
+async def run_sum(
+    settings: Settings, console: Console, arg: str | None, refresh: bool, full: bool = False
+) -> int:
     from wallexer.cli import source, stream
     from wallexer.store.db import init_db
 
@@ -461,6 +463,7 @@ async def run_sum(settings: Settings, console: Console, arg: str | None, refresh
                 json.loads(cached["explanation"]),
                 console,
                 note=f"cached {cached['created_at'][:16]} UTC · --refresh to regenerate",
+                full=full,
             )
             return 0
         explanation = None
@@ -501,7 +504,7 @@ async def run_sum(settings: Settings, console: Console, arg: str | None, refresh
         if today
         else "generated now"
     )
-    render(facts, explanation, console, note=note, error=err, llm_call_id=call_id)
+    render(facts, explanation, console, note=note, error=err, llm_call_id=call_id, full=full)
     return 0
 
 
@@ -525,7 +528,11 @@ def render(
     note: str = "",
     error: str | None = None,
     llm_call_id: int | None = None,
+    full: bool = False,
 ) -> None:
+    if not full:
+        render_brief(f, e, console, note=note, error=error)
+        return
     lo, hi = f["window_utc"]
     console.print(
         f"[key]Daily summary {f['date']}[/] · UTC {lo[11:16]}–{hi[11:16] if f['partial_day'] else '24:00'}"
@@ -642,6 +649,45 @@ def render(
         )
     if e.get("dropped_decision_ids"):
         console.print(f"[warn]dropped unknown cited decision ids: {e['dropped_decision_ids']}[/]")
+
+
+def render_brief(
+    f: dict[str, Any], e: dict[str, Any] | None, console: Console, *, note: str, error: str | None
+) -> None:
+    """Default `sum`: one verdict panel (what the agent decided and why) + a short market table."""
+    a = f["agent"]
+    console.print(
+        f"[key]Daily summary {f['date']}[/]{' (so far)' if f['partial_day'] else ''} · "
+        f"agent {a['cycles']} cycles, stances {a['stances'] or '{}'} · [muted]{note}[/]"
+    )
+    t = table(None, [("Market", "text"), ("Close", "num"), ("Change", "num"), ("Real. vol", "num")])
+    for m in f["markets"]:
+        chg = m.get("change_pct")
+        style = "ok" if chg and chg > 0 else "err" if chg and chg < 0 else ""
+        t.add_row(
+            m["market"],
+            _px(m.get("close")),
+            f"[{style}]{pct(chg, 2)}[/]" if style else pct(chg, 2),
+            pct(m.get("realized_vol_pct"), 2, signed=False),
+        )
+    console.print(t)
+    if e is None:
+        console.print(f"[err]LLM explanation unavailable[/] ({error})")
+    else:
+        color = {"low": "err", "medium": "warn", "high": "ok"}[e["confidence"]]
+        cites = ", ".join(f"#{i}" for i in e["cited_decision_ids"]) or "none"
+        console.print(
+            Panel(
+                f"{e['what_the_agent_decided_and_why']}\n\n"
+                f"[key]Confidence[/] [{color}]{e['confidence']}[/] · cited decisions {cites}",
+                title="What the agent decided and why",
+                expand=False,
+            )
+        )
+    console.print(
+        "[muted]`sum --full`: OHLC, spreads, regime, feed events, what the market did, "
+        "what would change its mind[/]"
+    )
 
 
 def _top(counts: dict[str, int], n: int = 5) -> str:

@@ -56,6 +56,11 @@ GROUPS: dict[str, list[tuple[str, str, str]]] = {
         ("sum [DATE]", "daily market + agent summary (facts + LLM explanation)", "sum yesterday"),
         ("log [N]", "all logs (paged), or entry N in full", "log 42"),
         ("export", "zip of decisions, orders, equity, LLM calls, reports, config", "export"),
+        (
+            "details [COMMAND]",
+            "a view with every detail (same as adding --full); default: status",
+            "details reason 12",
+        ),
     ],
     "Explain": [
         ("reason [N]", "static: all decisions, or decision N's numbers in full", "reason 17"),
