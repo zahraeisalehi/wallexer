@@ -169,28 +169,24 @@ def render_reason_overview(d: dict[str, Any], console: Console) -> None:
             p["strategy"], p["source"], str(p["n"]), tmn(p["net"], signed=True), tmn(p["fees"])
         )
     console.print(t)
+    # Narrow terminals (80 columns): drop Mode/Strategy and shorten the time so Reason stays readable.
+    wide = console.width >= 110
+    cols = [("#", "num"), ("Time (UTC)", "text")]
+    cols += [("Mode", "text")] if wide else []
+    cols += [("Action", "text"), ("Market", "text")]
+    cols += [("Strategy", "text")] if wide else []
     t = table(
         "Transactions / decisions · `wallexer reason <id>` for full detail",
-        [
-            ("#", "num"),
-            ("Time (UTC)", "text"),
-            ("Mode", "text"),
-            ("Action", "text"),
-            ("Market", "text"),
-            ("Strategy", "text"),
-            ("Reason", "text"),
-        ],
+        [*cols, ("Reason", "text")],
     )
+    for c in t.columns[:-1]:
+        c.no_wrap = True
     for x in d["decisions"]:
-        t.add_row(
-            str(x["id"]),
-            x["ts"][:19],
-            x["mode"],
-            x["action"],
-            x["symbol"] or "",
-            x["strategy"] or "",
-            (x["reason"] or "")[:90],
-        )
+        row = [str(x["id"]), x["ts"][:19] if wide else x["ts"][5:16].replace("T", " ")]
+        row += [x["mode"]] if wide else []
+        row += [x["action"], x["symbol"] or ""]
+        row += [x["strategy"] or ""] if wide else []
+        t.add_row(*row, (x["reason"] or "")[: 90 if wide else 160])
     console.print(t)
     if d["decisions_total"] > len(d["decisions"]):
         console.print(

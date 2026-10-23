@@ -20,7 +20,7 @@ from textual.widgets import Button, Footer, RichLog, Static
 
 from wallexer.cli import source
 from wallexer.cli.engine_cmds import get_status
-from wallexer.cli.theme import pct, tmn
+from wallexer.cli.theme import duration, pct, tmn
 from wallexer.config import Settings
 from wallexer.store.db import connect
 
@@ -206,7 +206,7 @@ class WatchApp(App):
         self.screen.set_classes("trade" if mode == "trade" else "shadow")
         tag = "LIVE TRADE (real orders)" if mode == "trade" else "SHADOW (simulated orders)"
         banner.update(
-            f"{tag} · run {st.get('run_id')} · uptime {st.get('uptime_s')}s{where}"
+            f"{tag} · run {st.get('run_id')} · uptime {duration(st.get('uptime_s'))}{where}"
             + ("" if live else " · stale (engine down)")
         )
         self.query_one("#numbers", Static).update(_numbers(st))

@@ -17,6 +17,8 @@ from wallexer.config import ConfigError, Settings
 
 # Set by the Typer callback (`--remote`); survives across commands inside the REPL.
 FORCED_REMOTE = {"on": False}
+# Set when the zero-setup demo server is unreachable: run local (public commands only).
+FORCED_LOCAL = {"on": False}
 
 # Commands that act on an engine, its settings or the account. Disabled in remote mode.
 # (backtest/doctor/markets/history/research stay available: they run locally, read-only on the
@@ -48,26 +50,36 @@ class RemoteError(Exception):
 @dataclass(frozen=True)
 class Remote:
     url: str
-    token: str
+    token: str  # "" = none (a public demo server needs none)
+    demo: bool = False  # the zero-setup default (no `wallexer setup` yet)
+
+
+def remote_on(settings: Settings) -> bool:
+    if FORCED_LOCAL["on"]:
+        return False
+    return FORCED_REMOTE["on"] or settings.cfg.remote.default
 
 
 def remote(settings: Settings) -> Remote | None:
     """The remote target if remote mode is on, else None (local)."""
     rc = settings.cfg.remote
-    if not (FORCED_REMOTE["on"] or rc.default):
+    if not remote_on(settings):
         return None
     url = (rc.url or settings.secrets.wallexer_remote_url or "").strip().rstrip("/")
     tok = settings.secrets.wallexer_view_token
     if not url:
         raise ConfigError("remote mode needs a server URL: run `wallexer setup` (remote).")
-    if tok is None or not tok.get_secret_value().strip():
-        raise ConfigError("remote mode needs a view token: run `wallexer setup` (remote).")
-    return Remote(url, tok.get_secret_value().strip())
+    # The token is optional: a public demo answers without one, a private server says 401.
+    return Remote(url, tok.get_secret_value().strip() if tok else "", rc.zero_config)
+
+
+def host(url: str) -> str:
+    return url.split("://", 1)[-1]
 
 
 def guard_write(settings: Settings, command: str) -> None:
     """Refuse state-changing commands in remote mode (raised before any request is made)."""
-    if FORCED_REMOTE["on"] or settings.cfg.remote.default:
+    if remote_on(settings):
         raise RemoteReadOnly(f"`{command}` is disabled in remote mode (read-only viewing)")
 
 
@@ -76,13 +88,20 @@ def api_get(r: Remote, path: str, params: dict[str, Any] | None = None, timeout:
         resp = httpx.get(
             f"{r.url}{path}",
             params={k: v for k, v in (params or {}).items() if v is not None},
-            headers={"X-View-Token": r.token},
+            headers={"X-View-Token": r.token} if r.token else {},
             timeout=timeout,
         )
     except httpx.HTTPError as e:
-        raise RemoteError(f"cannot reach {r.url}: {type(e).__name__}") from None
+        raise RemoteError(f"cannot reach {host(r.url)}: {type(e).__name__}") from None
     if resp.status_code == 401:
-        raise RemoteError("the server rejected the view token (check `wallexer setup`)")
+        from wallexer.config import credentials_path
+
+        raise RemoteError(
+            f"{host(r.url)} rejected the view token from {credentials_path()} (re-enter it with "
+            "`wallexer setup --mode remote`)"
+            if r.token
+            else f"{host(r.url)} needs a view token: `wallexer setup --mode remote`"
+        )
     if resp.status_code == 404 and path.startswith("/api/") and path.count("/") <= 2:
         raise RemoteError(
             f"{r.url} has no read-only API (WALLEXER_VIEW_TOKEN not set on the server, "
@@ -172,3 +191,14 @@ def origin_label(settings: Settings) -> str:
     except ConfigError:
         return "REMOTE (not configured)"
     return f"REMOTE {r.url}" if r else "LOCAL"
+
+
+def reachable(settings: Settings, timeout: float = 3.0) -> str | None:
+    """None if the remote answers /api/status (or remote mode is off), else a short reason."""
+    try:
+        r = remote(settings)
+        if r:
+            api_get(r, "/api/status", timeout=timeout)
+    except (RemoteError, ConfigError) as e:
+        return str(e)
+    return None

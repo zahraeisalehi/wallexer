@@ -42,6 +42,12 @@ def is_demo() -> bool:
     return os.environ.get("WALLEXER_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def is_view_public() -> bool:
+    """WALLEXER_VIEW_PUBLIC=1: the read-only /api/* needs no token. Only honoured together with
+    WALLEXER_DEMO=1 (the engine refuses to start otherwise, see engine/daemon.py)."""
+    return os.environ.get("WALLEXER_VIEW_PUBLIC", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _home_override() -> Path | None:
     h = os.environ.get("WALLEXER_HOME")
     return Path(h).expanduser() if h else None
@@ -303,6 +309,10 @@ class RemoteCfg(BaseModel):
     # `wallexer --remote` (or default=true) reads status/log/reason/rslt from this server's API.
     url: str = ""
     default: bool = False
+    # The public demo server: what a fresh install shows with zero setup.
+    demo_url: str = "https://wallexer-demo.liara.run"
+    # Set at load time: an installed copy with no user config (no `wallexer setup` yet).
+    zero_config: bool = False
 
 
 class StoreCfg(BaseModel):
@@ -410,6 +420,12 @@ def load_settings(config_path: Path | None = None) -> Settings:
     raw = _read_toml(config_path or DEFAULT_CONFIG)
     if not DEV or _home_override() is not None:
         raw = _deep_merge(raw, _read_toml(user_config_path()))
+    if not DEV and _home_override() is None and not user_config_path().exists():
+        # Zero setup: a fresh install watches the public demo (read-only, no token needed).
+        demo = os.environ.get("WALLEXER_DEMO_URL") or raw.get("remote", {}).get(
+            "demo_url", RemoteCfg().demo_url
+        )
+        raw = _deep_merge(raw, {"remote": {"url": demo, "default": True, "zero_config": True}})
     if is_demo():  # slower polling so the demo leaves the Wallex rate limit alone
         raw = _deep_merge(raw, _read_toml(DEFAULT_CONFIG.with_name("demo.toml")))
     try:

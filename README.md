@@ -10,23 +10,34 @@ shadow-traded and promoted only on out-of-sample evidence. An LLM agent (BoxAPI)
 risk, and a final risk gate can only shrink or reject orders. Until a strategy proves an edge after
 fees, the engine stays flat by design.
 
+Then `Run: wallexer`. No questions, no keys: it opens straight into the **public demo**
+(https://wallexer-demo.liara.run, a shadow-only engine that can never place an order), read-only.
+
 ## 30-second tour
 
+Inside the app (or as `wallexer <command>` from your shell):
+
 ```sh
-wallexer                 # opens the shell; the first run offers the setup wizard
-wallexer markets         # allowed markets, spreads, fees, round-trip cost (no keys needed)
-wallexer help            # every command, grouped, with an example each
-wallexer setup           # local (Wallex + BoxAPI keys) or remote (server URL + view token)
-wallexer status          # mode, equity, PnL, drawdown, schedule, per-market state
-wallexer sum yesterday   # daily market + agent summary: facts, then an LLM explanation
+status                   # mode, equity, PnL, drawdown, schedule, per-market state
+watch                    # live split view: numbers update in place, decisions + events stream in
+sum                      # today's market + agent summary: facts, then the LLM explanation
+reason 12                # one decision in full: features, signals, weights, risk checks, orders
+exp-reason               # the LLM's plain-language explanation of the latest decision
+trade                    # refused on the demo: `wallexer setup` runs your own engine
 ```
 
 ## Using the CLI
 
-`wallexer` with no arguments opens an interactive shell. It shows a banner with LOCAL or REMOTE,
-the engine mode, equity and the event schedule, and every command works there without the prefix.
-Tab completes, history is kept, and a typo gets a suggestion. Ctrl-C clears the line and never
-touches a running engine, because engines run detached.
+`wallexer` with no arguments opens a full-screen app (alternate screen; your terminal comes back
+as it was when you leave). The header shows LOCAL or REMOTE, DEMO / SHADOW / LIVE badges, equity,
+PnL, drawdown, the agent's stance and countdowns to entries-stop, flatten and the end; numbers
+update in place and pulse when they change. Commands render below; long ones show a spinner, `watch`
+opens a split view, and `sum` / `exp-reason` stream the LLM answer as it arrives (with a local
+BoxAPI key; against the demo they show the server's pre-generated answer).
+Keys: Enter runs, ↑/↓ history, Tab completes, Ctrl-L clears, F1 help, `q` (empty line) or Ctrl-D
+quits. Engines run detached, so quitting never touches one. Without a real terminal (pipes,
+`TERM=dumb`, or `WALLEXER_PLAIN=1`) the line shell opens instead. `wallexer <command>` from the
+shell prints plain, scriptable output.
 
 | Group | Commands |
 |---|---|
@@ -55,7 +66,11 @@ touches a running engine, because engines run detached.
 ### Remote viewing
 
 The engine on the server serves a token-protected, GET-only API next to `/health`. Run
-`wallexer setup --mode remote` (server URL plus view token), or add `--remote` to a command.
+`wallexer setup --mode remote` (server URL plus view token, checked against the server before it
+is saved), or add `--remote` to a command. A fresh install with no `wallexer setup` watches the
+public demo, whose API needs no token (`WALLEXER_VIEW_PUBLIC=1`, allowed only on a demo server);
+if it is unreachable, `wallexer` says so in one line and runs local public commands
+(`markets`, `help`, `setup`).
 `status`, `watch`, `log`, `reason`, `rslt` and `sum` then read the server. Commands that change
 state are disabled in remote mode. Server setup is in `docs/RUNBOOK.md`.
 

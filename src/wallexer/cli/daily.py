@@ -359,8 +359,18 @@ def unknown_numbers(answer: str, source: str) -> list[str]:
     return bad
 
 
+SUM_FIELDS = {
+    "what_the_market_did": "What the market did",
+    "what_the_agent_decided_and_why": "What the agent decided and why",
+    "what_would_change_its_mind": "What would change its mind",
+}
+
+
 async def explain(
-    settings: Settings, conn: sqlite3.Connection, facts: dict[str, Any]
+    settings: Settings,
+    conn: sqlite3.Connection,
+    facts: dict[str, Any],
+    on_text: Any = None,
 ) -> tuple[dict[str, Any] | None, int | None, str | None]:
     from wallexer.agent.client import LlmClient
     from wallexer.agent.schema import DailySummary, daily_summary_schema
@@ -381,6 +391,7 @@ async def explain(
             schema=daily_summary_schema(),
             model=DailySummary,
             schema_name="daily_summary",
+            on_text=on_text,
         )
     finally:
         await client.close()
@@ -406,9 +417,34 @@ async def explain(
 # ---------------------------------------------------------------------------------- command
 
 
+def store_summary(
+    conn: sqlite3.Connection,
+    day: date,
+    origin: str,
+    facts: dict[str, Any],
+    explanation: dict[str, Any] | None,
+    call_id: int | None,
+) -> None:
+    from wallexer.store.db import now_iso
+
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_summaries (date, origin, created_at, facts, explanation,"
+            " llm_call_id) VALUES (?,?,?,?,?,?)",
+            (
+                day.isoformat(),
+                origin,
+                now_iso(),
+                json.dumps(facts, default=str),
+                json.dumps(explanation) if explanation else None,
+                call_id,
+            ),
+        )
+
+
 async def run_sum(settings: Settings, console: Console, arg: str | None, refresh: bool) -> int:
-    from wallexer.cli import source
-    from wallexer.store.db import init_db, now_iso
+    from wallexer.cli import source, stream
+    from wallexer.store.db import init_db
 
     day = parse_day(arg)
     today = day == datetime.now(UTC).date()
@@ -431,7 +467,9 @@ async def run_sum(settings: Settings, console: Console, arg: str | None, refresh
         if r:
             data = source.api_get(r, "/api/sum", {"date": day.isoformat()}) or {}
             facts = data.get("facts")
-            if not refresh and not today:
+            # The server's own answer (the demo regenerates today's hourly), unless --refresh
+            # asks for a fresh one with the local key.
+            if not refresh:
                 explanation = data.get("explanation")
         else:
             facts = daily_facts(conn, day)
@@ -442,29 +480,25 @@ async def run_sum(settings: Settings, console: Console, arg: str | None, refresh
             )
             return 1
         call_id, err = None, None
+        from_server = explanation is not None
         if explanation is None:
-            with console.status("Asking the LLM for the explanation (anonymized facts)…"):
-                explanation, call_id, err = await explain(settings, conn, facts)
-        with conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO daily_summaries (date, origin, created_at, facts, explanation,"
-                " llm_call_id) VALUES (?,?,?,?,?,?)",
-                (
-                    day.isoformat(),
-                    origin,
-                    now_iso(),
-                    json.dumps(facts, default=str),
-                    json.dumps(explanation) if explanation else None,
-                    call_id,
-                ),
-            )
+            key = settings.secrets.boxapi_api_key
+            if r and not (key and key.get_secret_value()):
+                err = "no explanation on the server yet, and no local BoxAPI key (`wallexer setup`)"
+            else:
+                with (
+                    console.status("Asking the LLM for the explanation (anonymized facts)…"),
+                    stream.block(f"Summary of {day}", SUM_FIELDS) as on_text,
+                ):
+                    explanation, call_id, err = await explain(settings, conn, facts, on_text)
+        store_summary(conn, day, origin, facts, explanation, call_id)
     finally:
         conn.close()
     note = (
-        "today so far: regenerated on every run"
+        "explanation from the server" + (" (today: regenerated hourly)" if today else "")
+        if from_server
+        else "today so far: regenerated on every run"
         if today
-        else "explanation from the server's cache"
-        if r and call_id is None and not err
         else "generated now"
     )
     render(facts, explanation, console, note=note, error=err, llm_call_id=call_id)

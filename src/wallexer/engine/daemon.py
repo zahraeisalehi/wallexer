@@ -32,7 +32,7 @@ from wallexer.alloc.regime import REGIME_TF, build_reference, classify
 from wallexer.alloc.usdt_inventory import decide as usdt_decide
 from wallexer.alloc.usdt_inventory import target_frac as usdt_target
 from wallexer.backtest.report import latest_run, stats_from_json
-from wallexer.config import ConfigError, Mode, Settings, is_demo
+from wallexer.config import ConfigError, Mode, Settings, is_demo, is_view_public
 from wallexer.data.features import Features, basis_features, imbalance, market_features
 from wallexer.data.feed import MarketFeed
 from wallexer.data.history import load_bars, sync_history
@@ -80,6 +80,9 @@ class Engine:
             raise ConfigError("engine runs shadow or trade; backtest is a separate command")
         if mode is Mode.trade and is_demo():
             raise ConfigError("demo server (WALLEXER_DEMO=1): trade mode is refused; shadow only")
+        if is_view_public() and not is_demo():
+            # A token-free view is for the public demo only, never for an engine with real keys.
+            raise ConfigError("WALLEXER_VIEW_PUBLIC=1 is only allowed with WALLEXER_DEMO=1")
         self.settings = settings
         self.mode = mode
         self.only = [m.upper() for m in markets] if markets else None
@@ -1050,6 +1053,53 @@ class Engine:
             for t in book.step(sigs, f, now, trades=trades):
                 repo.insert_paper_trade(self.conn, t, self.run_id)
 
+    async def _demo_explain_loop(self) -> None:
+        """Demo only: pre-generate the LLM answers the public view shows (`sum` for today hourly
+        and yesterday once, `exp-reason` for each new agent decision). The read-only API only
+        reads them, so no visitor can trigger an LLM call. Never touches trading state."""
+        from datetime import timedelta
+
+        from wallexer.cli import daily, views
+        from wallexer.cli.logs import explain_decision
+
+        await asyncio.sleep(120)  # after the first agent decision (~90 s after start)
+        while not self.stopping.is_set():
+            try:
+                row = self.conn.execute(
+                    "SELECT d.id FROM decisions d LEFT JOIN explanations e ON e.decision_id = d.id"
+                    " WHERE d.action = 'agent_decision' AND e.decision_id IS NULL"
+                    " ORDER BY d.id DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    rec = views.reason_data(self.conn, row[0])
+                    if rec:
+                        await explain_decision(
+                            self.settings, self.conn, row[0], rec, float(self.equity or 0) or 5e6
+                        )
+                today = datetime.now(UTC).date()
+                for day, max_age_s in ((today, 3600.0), (today - timedelta(days=1), None)):
+                    have = self.conn.execute(
+                        "SELECT created_at, explanation FROM daily_summaries"
+                        " WHERE date=? AND origin='LOCAL'",
+                        (day.isoformat(),),
+                    ).fetchone()
+                    if have and have[1]:
+                        if max_age_s is None:
+                            continue
+                        age = time.time() - datetime.fromisoformat(have[0]).timestamp()
+                        if age < max_age_s:
+                            continue
+                    facts = daily.daily_facts(self.conn, day)
+                    if not facts["has_data"]:
+                        continue
+                    e, call_id, _err = await daily.explain(self.settings, self.conn, facts)
+                    daily.store_summary(self.conn, day, "LOCAL", facts, e, call_id)
+                    log_event(self.conn, "demo.summary", {"date": day.isoformat(), "ok": bool(e)})
+            except Exception as e:  # explanations are cosmetic: never take the engine down
+                log.warning("demo.explain_error", error=str(e)[:200])
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.stopping.wait(), timeout=300)
+
     async def _agent_loop(self) -> None:
         acfg = self.settings.cfg.agent
         assert self.agent_event is not None
@@ -1317,6 +1367,7 @@ class Engine:
         return {
             "mode": self.mode.value,
             "demo": is_demo(),
+            "view_public": is_view_public() and is_demo(),
             "starting": self.last_tick is None,
             "last_tick": self.last_tick,
             "equity_tmn": f"{self.equity:.0f}",
@@ -1572,6 +1623,8 @@ class Engine:
                 # first decision ~90 s after start, once promotions/regime/allocation exist
                 self.agent_last_run = time.time() - self.settings.cfg.agent.interval_min * 60 + 90
                 tasks.append(asyncio.create_task(self._agent_loop()))
+            if is_demo() and self.settings.secrets.boxapi_api_key:
+                tasks.append(asyncio.create_task(self._demo_explain_loop()))
             await self.stopping.wait()
             for t in tasks:
                 t.cancel()

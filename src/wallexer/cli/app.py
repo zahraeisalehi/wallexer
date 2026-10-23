@@ -28,6 +28,8 @@ from wallexer.logging import setup_logging
 
 console = make_console()
 err_console = make_console(stderr=True)
+# Set by the full-screen app (cli/tui.py): `watch` and a started engine open its split view.
+WATCH_HOOK: dict[str, Callable[[], None] | None] = {"fn": None}
 
 app = typer.Typer(
     name="wallexer",
@@ -109,14 +111,19 @@ def root(
         source.FORCED_REMOTE["on"] = True
     cmd = ctx.invoked_subcommand
     if cmd is None:
-        from wallexer.cli.repl import run_repl
-        from wallexer.cli.setup import needs_setup, run_setup
+        # No questions: a fresh install opens straight into the public demo (remote, read-only).
+        # `wallexer setup` configures a local engine or a private server.
+        notice = _probe_remote()
+        from wallexer.cli.tui import can_run_app, run_app
 
-        if needs_setup() and sys.stdin.isatty():
-            ans = console.input("No configuration yet. Run the setup wizard now? \\[Y/n] ")
-            if ans.strip().lower() not in ("n", "no"):
-                run_setup(console)
-        run_repl(app, console)
+        if can_run_app():
+            run_app(notice)
+        else:
+            from wallexer.cli.repl import run_repl
+
+            if notice:
+                console.print(f"[warn]{notice}[/]")
+            run_repl(app, console)
         return
     if cmd in DEMO_REFUSED and is_demo():
         _err(
@@ -126,15 +133,37 @@ def root(
         raise typer.Exit(2)
     if cmd in source.WRITE_COMMANDS:
         try:
-            on = source.FORCED_REMOTE["on"] or load_settings().cfg.remote.default
+            on = source.remote_on(load_settings())
         except ConfigError:
             on = source.FORCED_REMOTE["on"]
         if on:
+            try:
+                demo = load_settings().cfg.remote.zero_config and not source.FORCED_REMOTE["on"]
+            except ConfigError:
+                demo = False
             _err(
                 f"`{cmd}` is disabled in remote mode (read-only viewing)",
-                "run it on the server, or locally without --remote",
+                "this is the public demo: `wallexer setup` sets up your own engine"
+                if demo
+                else "run it on the server, or locally without --remote",
             )
             raise typer.Exit(2)
+
+
+def _probe_remote() -> str | None:
+    """Zero-setup demo unreachable → local mode with a one-line notice (None if all is well)."""
+    try:
+        settings = load_settings()
+        r = source.remote(settings)
+    except ConfigError:
+        return None
+    if r is None or not r.demo:
+        return None  # local, or a server the user configured: errors show in the header
+    why = source.reachable(settings)
+    if why is None:
+        return None
+    source.FORCED_LOCAL["on"] = True
+    return f"demo server unreachable ({why}): local public commands only: markets, help, setup"
 
 
 @_cmd("markets")
@@ -249,7 +278,9 @@ def _launch(settings: Any, mode: Any, mkts: list[str], no_watch: bool) -> None:
     label = "[live] LIVE engine [/]" if mode.value == "trade" else "[shadow] SHADOW engine [/]"
     scope = ", ".join(mkts) if mkts else "whole universe"
     console.print(f"{label} running (pid {pid}) · {scope} · `wallexer status`, `wallexer stop`")
-    if not no_watch and sys.stdout.isatty():
+    if not no_watch and WATCH_HOOK["fn"] is not None:
+        WATCH_HOOK["fn"]()  # inside the full-screen app: open its split view
+    elif not no_watch and sys.stdout.isatty():
         from wallexer.cli.watch import run_watch
 
         run_watch(settings)
@@ -702,6 +733,9 @@ def watch() -> None:
     from wallexer.cli.watch import run_watch
 
     settings = load_settings()
+    if WATCH_HOOK["fn"] is not None:
+        WATCH_HOOK["fn"]()  # inside the full-screen app: toggle its split view
+        return
     if not sys.stdout.isatty():
         raise InputError("watch needs an interactive terminal; use `wallexer status` instead")
     run_watch(settings)

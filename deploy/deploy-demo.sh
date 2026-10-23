@@ -48,6 +48,9 @@ fi
 if has WALLEXER_DEMO; then
   [ "$(value WALLEXER_DEMO)" = "1" ] || fail "WALLEXER_DEMO on $DEMO_APP must be 1 (it overrides the image)"
 fi
+# Zero-setup installs watch the demo without a token: the public read-only view must be on.
+has WALLEXER_VIEW_PUBLIC && [ "$(value WALLEXER_VIEW_PUBLIC)" = "1" ] \
+  || fail "WALLEXER_VIEW_PUBLIC=1 is not set on $DEMO_APP (liara env set -a $DEMO_APP --team-id $TEAM WALLEXER_VIEW_PUBLIC=1)"
 
 # 3. Clean staging copy: tracked + untracked-not-ignored files, never .env*, DBs or logs.
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/wallexer-demo.XXXXXX")"

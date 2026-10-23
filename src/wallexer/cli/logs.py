@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
@@ -24,7 +25,7 @@ def _conn(settings: Settings) -> sqlite3.Connection:
 
 
 def show_log(settings: Settings, console: Console, n: int | None) -> None:
-    views.render_log(source.log(settings, n), console, paged=console.is_terminal)
+    views.render_log(source.log(settings, n), console, paged=console.is_interactive)
 
 
 def show_reason(settings: Settings, console: Console, n: int | None) -> None:
@@ -43,6 +44,7 @@ You get the bot's own static decision record (features, signal values and thresh
 risk-gate checks, before/after numbers, resulting orders). Explain ONLY from this record; do not invent data.
 Fields: summary (2-3 sentences), why_this_action (cite the numbers and thresholds that fired),
 risk (what could go wrong / what limited the risk), confidence (low|medium|high in the decision's soundness)."""
+EXP_FIELDS = {"summary": "Summary", "why_this_action": "Why this action", "risk": "Risk"}
 
 
 def anonymize(obj: Any, equity_tmn: float) -> Any:
@@ -65,12 +67,69 @@ def anonymize(obj: Any, equity_tmn: float) -> Any:
     return obj
 
 
-async def exp_reason(settings: Settings, console: Console, n: int | None) -> None:
+def exp_payload(record: dict[str, Any], equity_tmn: float) -> dict[str, Any]:
+    """The anonymized decision record sent to the LLM (no ids, sizes as % of equity)."""
+    payload = anonymize(record, equity_tmn)
+    for o in payload.get("orders", []):
+        o.pop("client_id", None)
+        if o.get("quantity"):
+            o["quantity"] = "redacted (size shown as % of equity elsewhere)"
+    return payload
+
+
+async def explain_decision(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    decision_id: int,
+    record: dict[str, Any],
+    equity_tmn: float,
+    on_text: Callable[[str], None] | None = None,
+) -> Any:
+    """One LLM call; a valid answer is stored in `explanations` (also read by /api/explain)."""
     from wallexer.agent.client import LlmClient
     from wallexer.agent.schema import Explanation, explanation_schema
+    from wallexer.store.db import now_iso
 
-    # The decision record comes from the local DB or the remote API; the LLM call (and its
-    # llm_calls row) is always local, with the local BoxAPI key.
+    client = LlmClient(settings, conn)
+    try:
+        res = await client.structured(
+            purpose="exp_reason",
+            system=EXP_SYSTEM,
+            user=json.dumps(
+                exp_payload(record, equity_tmn), ensure_ascii=False, sort_keys=True, default=str
+            ),
+            schema=explanation_schema(),
+            model=Explanation,
+            schema_name="explanation",
+            on_text=on_text,
+        )
+    finally:
+        await client.close()
+    if res.parsed is not None:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO explanations (decision_id, created_at, explanation,"
+                " llm_call_id) VALUES (?,?,?,?)",
+                (decision_id, now_iso(), res.parsed.model_dump_json(), res.llm_call_id),
+            )
+    return res
+
+
+def render_explanation(e: dict[str, Any], n: int, label: str, console: Console) -> None:
+    color = {"low": "err", "medium": "warn", "high": "ok"}.get(e.get("confidence", ""), "muted")
+    console.print(
+        Panel(
+            f"[bold]Summary[/]\n{e['summary']}\n\n[bold]Why this action[/]\n{e['why_this_action']}\n\n"
+            f"[bold]Risk[/]\n{e['risk']}\n\n[bold]Confidence[/] [{color}]{e['confidence']}[/]",
+            title=f"Explanation of decision #{n} ({label})",
+            expand=False,
+        )
+    )
+
+
+async def exp_reason(settings: Settings, console: Console, n: int | None) -> None:
+    from wallexer.cli import stream
+
     if n is None:
         decisions = (source.reason(settings, None) or {}).get("decisions") or []
         if not decisions:
@@ -79,29 +138,37 @@ async def exp_reason(settings: Settings, console: Console, n: int | None) -> Non
             )
             return
         n = decisions[-1]["id"]
+    r = source.remote(settings)
+    has_key = bool(
+        settings.secrets.boxapi_api_key and settings.secrets.boxapi_api_key.get_secret_value()
+    )
+    if r:
+        # The server's pre-generated answer first (demo); else the local key, if there is one.
+        cached = source.api_get(r, f"/api/explain/{n}")
+        if cached:
+            render_explanation(
+                cached["explanation"], n, f"server, {cached['created_at'][11:16]} UTC", console
+            )
+            return
+        if not has_key:
+            console.print(
+                f"Decision #{n} has no server explanation yet (the demo explains each new agent "
+                f"decision within ~5 min). Its static record: `reason {n}`. With your own BoxAPI "
+                "key (`wallexer setup`) it is explained here."
+            )
+            return
     p = source.reason(settings, n)
     if p is None:
         console.print(f"[err]no decision #{n}[/] · list them with `wallexer reason`")
         return
+    # The decision record comes from the local DB or the remote API; the LLM call (and its
+    # llm_calls row) is local, with the local BoxAPI key.
     st, _live, _origin = source.status(settings)
     equity = float((st or {}).get("equity_tmn") or settings.cfg.account.expected_equity_tmn)
     conn = _conn(settings)
     try:
-        payload = anonymize(p, equity)
-        for o in payload.get("orders", []):
-            o.pop("client_id", None)
-            if o.get("quantity"):
-                o["quantity"] = "redacted (size shown as % of equity elsewhere)"
-        client = LlmClient(settings, conn)
-        res = await client.structured(
-            purpose="exp_reason",
-            system=EXP_SYSTEM,
-            user=json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
-            schema=explanation_schema(),
-            model=Explanation,
-            schema_name="explanation",
-        )
-        await client.close()
+        with stream.block(f"Explaining decision #{n}", EXP_FIELDS) as on_text:
+            res = await explain_decision(settings, conn, n, p, equity, on_text)
     finally:
         conn.close()
     if res.parsed is None:
@@ -109,13 +176,6 @@ async def exp_reason(settings: Settings, console: Console, n: int | None) -> Non
             f"[err]LLM explanation unavailable[/] ({res.error}). The static record: `wallexer reason {n}`."
         )
         return
-    e: Explanation = res.parsed  # type: ignore[assignment]
-    color = {"low": "err", "medium": "warn", "high": "ok"}[e.confidence]
-    console.print(
-        Panel(
-            f"[bold]Summary[/]\n{e.summary}\n\n[bold]Why this action[/]\n{e.why_this_action}\n\n"
-            f"[bold]Risk[/]\n{e.risk}\n\n[bold]Confidence[/] [{color}]{e.confidence}[/]",
-            title=f"Explanation of decision #{n} ({res.source}, llm_call #{res.llm_call_id})",
-            expand=False,
-        )
+    render_explanation(
+        res.parsed.model_dump(), n, f"{res.source}, llm_call #{res.llm_call_id}", console
     )

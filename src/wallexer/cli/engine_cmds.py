@@ -97,6 +97,8 @@ def render_status(st: dict[str, Any], live: bool, console: Console, origin: str 
     banner = (
         "[shadow] SHADOW · simulated orders [/]" if shadow else "[live] TRADE · LIVE ORDERS [/]"
     )
+    if st.get("demo"):
+        banner = f"[demo] DEMO [/] {banner}"
     age = (
         ""
         if live
@@ -282,12 +284,9 @@ def schedule_line(sch: dict[str, Any]) -> str:
 
 
 def _uptime(s: Any) -> str:
-    try:
-        s = int(s)
-    except (TypeError, ValueError):
-        return "–"
-    h, rem = divmod(s, 3600)
-    return f"{h}h {rem // 60:02d}m" if h else f"{rem // 60}m {rem % 60:02d}s"
+    from wallexer.cli.theme import duration
+
+    return duration(s)
 
 
 STATE_STYLE = {

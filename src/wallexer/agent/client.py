@@ -15,6 +15,7 @@ import hashlib
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -117,6 +118,36 @@ class LlmClient:
         except ValidationError:
             return None
 
+    async def _streamed(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        fmt: dict[str, Any],
+        on_text: Callable[[str], None],
+    ) -> str:
+        """Same request with stream=True (only for display: the result is validated as usual).
+        If the gateway rejects streaming, the plain call is made instead."""
+        import openai
+
+        try:
+            chunks = await self._openai().chat.completions.create(
+                model=model, messages=messages, temperature=0, response_format=fmt, stream=True
+            )
+        except openai.BadRequestError:
+            resp = await self._openai().chat.completions.create(
+                model=model, messages=messages, temperature=0, response_format=fmt
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            on_text(text)
+            return text
+        parts: list[str] = []
+        async for ch in chunks:
+            delta = ch.choices[0].delta.content if ch.choices else None
+            if delta:
+                parts.append(delta)
+                on_text("".join(parts))
+        return "".join(parts).strip()
+
     async def structured(
         self,
         *,
@@ -126,6 +157,7 @@ class LlmClient:
         schema: dict[str, Any],
         model: type[T],
         schema_name: str,
+        on_text: Callable[[str], None] | None = None,
     ) -> CallResult:
         lc = self.settings.cfg.llm
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -154,16 +186,17 @@ class LlmClient:
             t0 = time.monotonic()
             text = None
             try:
-                resp = await self._openai().chat.completions.create(
-                    model=lc.model,
-                    messages=attempt_msgs,
-                    temperature=0,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-                    },
-                )
-                text = (resp.choices[0].message.content or "").strip()
+                fmt = {
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+                }
+                if on_text is not None:
+                    text = await self._streamed(lc.model, attempt_msgs, fmt, on_text)
+                else:
+                    resp = await self._openai().chat.completions.create(
+                        model=lc.model, messages=attempt_msgs, temperature=0, response_format=fmt
+                    )
+                    text = (resp.choices[0].message.content or "").strip()
                 parsed = model.model_validate_json(text)
                 cid = _record(
                     self.conn,
