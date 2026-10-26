@@ -21,13 +21,6 @@ from wallexer.config import DEV, _home_override, config_home, credentials_path, 
 SECRET_KEYS = ("WALLEX_API_KEY", "WALLEX_SUBACCOUNT_ID", "BOXAPI_API_KEY", "WALLEXER_VIEW_TOKEN")
 
 
-def needs_setup() -> bool:
-    """Installed layout and no user config yet (dev checkouts use ./.env and never ask)."""
-    if DEV and _home_override() is None:
-        return False
-    return not user_config_path().exists()
-
-
 def _read_env(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if path.exists():

@@ -180,28 +180,6 @@ def insert_paper_equity(
     )
 
 
-def insert_allocation(
-    conn: sqlite3.Connection,
-    *,
-    run_id: str | None,
-    baseline: dict[str, Any],
-    agent: dict[str, Any] | None,
-    final: dict[str, Any],
-    source: str,
-) -> None:
-    conn.execute(
-        "INSERT INTO allocations (ts, run_id, baseline, agent, final, source) VALUES (?,?,?,?,?,?)",
-        (
-            now_iso(),
-            run_id,
-            dumps(baseline),
-            dumps(agent) if agent is not None else None,
-            dumps(final),
-            source,
-        ),
-    )
-
-
 def insert_equity(
     conn: sqlite3.Connection,
     *,
@@ -249,16 +227,3 @@ def insert_candles(conn: sqlite3.Connection, symbol: str, resolution: str, bars:
         " VALUES (?,?,?,?,?,?,?,?)",
         [(symbol, resolution, b.t, _s(b.o), _s(b.h), _s(b.l), _s(b.c), _s(b.v)) for b in bars],
     )
-
-
-def paper_stats(conn: sqlite3.Connection, run_id: str | None = None) -> list[sqlite3.Row]:
-    """Per strategy/source: trade count, net PnL, gross profit/loss (profit factor)."""
-    where, args = ("WHERE run_id=?", (run_id,)) if run_id else ("", ())
-    return conn.execute(
-        "SELECT strategy, source, SUM(kind != 'conversion') AS n,"
-        " SUM(CAST(net_tmn AS REAL)) AS net,"
-        " SUM(CASE WHEN CAST(net_tmn AS REAL) > 0 THEN CAST(net_tmn AS REAL) ELSE 0 END) AS gp,"
-        " SUM(CASE WHEN CAST(net_tmn AS REAL) < 0 THEN -CAST(net_tmn AS REAL) ELSE 0 END) AS gl"
-        f" FROM paper_trades {where} GROUP BY strategy, source",
-        args,
-    ).fetchall()

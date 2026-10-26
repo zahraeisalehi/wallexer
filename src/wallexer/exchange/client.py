@@ -372,32 +372,3 @@ class WallexClient:
         )
         result = body.get("result") or {}
         return {s: [_order(o) for o in _list(lst)] for s, lst in result.items()}
-
-    async def order_history(
-        self,
-        market: str | None = None,
-        type: str | None = None,
-        side: str | None = None,
-        page: int | None = None,
-        per_page: int | None = None,
-        from_date: str | None = None,
-        to_date: str | None = None,
-    ) -> dict[str, list[Order]]:
-        """Dates are YYYY-MM-DD; per_page max 100."""
-        if per_page is not None:
-            per_page = min(per_page, 100)
-        body = await self._get(
-            "/v1/account/orders",
-            params={
-                "market": market,
-                "type": type,
-                "side": side,
-                "page": page,
-                "per_page": per_page,
-                "from": from_date,
-                "to": to_date,
-            },
-            private=True,
-        )
-        result = body.get("result") or {}
-        return {s: [_order(o) for o in _list(lst)] for s, lst in result.items()}

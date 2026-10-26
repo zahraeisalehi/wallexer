@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from rich.console import Console
 
 from wallexer.agent.agent import Applied, anonymize_snapshot, apply_decision
 from wallexer.agent.agent import ask as agent_ask
@@ -1053,52 +1054,65 @@ class Engine:
             for t in book.step(sigs, f, now, trades=trades):
                 repo.insert_paper_trade(self.conn, t, self.run_id)
 
-    async def _demo_explain_loop(self) -> None:
-        """Demo only: pre-generate the LLM answers the public view shows (`sum` for today hourly
-        and yesterday once, `exp-reason` for each new agent decision). The read-only API only
-        reads them, so no visitor can trigger an LLM call. Never touches trading state."""
+    async def _explain_loop(self) -> None:
+        """Pre-generate LLM explanations so the views and the export only read them:
+        - every engine: `exp-reason` for decisions that have none yet (up to 10 a minute, newest
+          first), which fills explanations.md in the export (/export, `wallexer export`);
+        - demo only: `sum` for today hourly and yesterday once (the public view shows them).
+        No request can trigger an LLM call. Never touches trading state."""
         from datetime import timedelta
 
-        from wallexer.cli import daily, views
-        from wallexer.cli.logs import explain_decision
+        from wallexer.cli import daily
+        from wallexer.cli.logs import backfill_explanations
 
         await asyncio.sleep(120)  # after the first agent decision (~90 s after start)
+        next_sum = 0.0
         while not self.stopping.is_set():
             try:
-                row = self.conn.execute(
-                    "SELECT d.id FROM decisions d LEFT JOIN explanations e ON e.decision_id = d.id"
-                    " WHERE d.action = 'agent_decision' AND e.decision_id IS NULL"
-                    " ORDER BY d.id DESC LIMIT 1"
-                ).fetchone()
-                if row:
-                    rec = views.reason_data(self.conn, row[0])
-                    if rec:
-                        await explain_decision(
-                            self.settings, self.conn, row[0], rec, float(self.equity or 0) or 5e6
+                await backfill_explanations(
+                    self.settings, self.conn, float(self.equity or 0) or 5e6, limit=10
+                )
+                if is_demo() and time.time() >= next_sum:
+                    next_sum = time.time() + 300
+                    today = datetime.now(UTC).date()
+                    for day, max_age_s in ((today, 3600.0), (today - timedelta(days=1), None)):
+                        have = self.conn.execute(
+                            "SELECT created_at, explanation FROM daily_summaries"
+                            " WHERE date=? AND origin='LOCAL'",
+                            (day.isoformat(),),
+                        ).fetchone()
+                        if have and have[1]:
+                            if max_age_s is None:
+                                continue
+                            age = time.time() - datetime.fromisoformat(have[0]).timestamp()
+                            if age < max_age_s:
+                                continue
+                        facts = daily.daily_facts(self.conn, day)
+                        if not facts["has_data"]:
+                            continue
+                        e, call_id, _err = await daily.explain(self.settings, self.conn, facts)
+                        daily.store_summary(self.conn, day, "LOCAL", facts, e, call_id)
+                        log_event(
+                            self.conn, "demo.summary", {"date": day.isoformat(), "ok": bool(e)}
                         )
-                today = datetime.now(UTC).date()
-                for day, max_age_s in ((today, 3600.0), (today - timedelta(days=1), None)):
-                    have = self.conn.execute(
-                        "SELECT created_at, explanation FROM daily_summaries"
-                        " WHERE date=? AND origin='LOCAL'",
-                        (day.isoformat(),),
-                    ).fetchone()
-                    if have and have[1]:
-                        if max_age_s is None:
-                            continue
-                        age = time.time() - datetime.fromisoformat(have[0]).timestamp()
-                        if age < max_age_s:
-                            continue
-                    facts = daily.daily_facts(self.conn, day)
-                    if not facts["has_data"]:
-                        continue
-                    e, call_id, _err = await daily.explain(self.settings, self.conn, facts)
-                    daily.store_summary(self.conn, day, "LOCAL", facts, e, call_id)
-                    log_event(self.conn, "demo.summary", {"date": day.isoformat(), "ok": bool(e)})
             except Exception as e:  # explanations are cosmetic: never take the engine down
-                log.warning("demo.explain_error", error=str(e)[:200])
+                log.warning("explain.error", error=str(e)[:200])
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self.stopping.wait(), timeout=300)
+                await asyncio.wait_for(self.stopping.wait(), timeout=60)
+
+    async def _export_zip(self) -> bytes:
+        """GET /export: the same zip as `wallexer export` (explanations come from the store)."""
+        import io
+
+        from wallexer.cli.results import export
+        from wallexer.cli.theme import THEME
+
+        quiet = Console(file=io.StringIO(), theme=THEME)
+        path = Path(await asyncio.to_thread(export, self.settings, quiet, None))
+        try:
+            return await asyncio.to_thread(path.read_bytes)
+        finally:
+            path.unlink(missing_ok=True)
 
     async def _agent_loop(self) -> None:
         acfg = self.settings.cfg.agent
@@ -1595,7 +1609,7 @@ class Engine:
                 float(self.settings.cfg.account.expected_equity_tmn),
                 float(self.settings.cfg.paper.capital_tmn),
             )
-            servers.append(await health.serve(ecfg.health_port, self.health, api))
+            servers.append(await health.serve(ecfg.health_port, self.health, api, self._export_zip))
             await self.startup()
             servers.append(await control.serve(sock, self.handle))
             tasks = [
@@ -1623,8 +1637,8 @@ class Engine:
                 # first decision ~90 s after start, once promotions/regime/allocation exist
                 self.agent_last_run = time.time() - self.settings.cfg.agent.interval_min * 60 + 90
                 tasks.append(asyncio.create_task(self._agent_loop()))
-            if is_demo() and self.settings.secrets.boxapi_api_key:
-                tasks.append(asyncio.create_task(self._demo_explain_loop()))
+            if self.settings.secrets.boxapi_api_key:
+                tasks.append(asyncio.create_task(self._explain_loop()))
             await self.stopping.wait()
             for t in tasks:
                 t.cancel()

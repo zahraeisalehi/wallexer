@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="wx logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10202B"/>
+      <stop offset="1" stop-color="#1F3A4D"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="224" height="224" rx="56" fill="url(#g)"/>
+  <path d="M40 176 L84 132 L112 150 L150 104 L196 64" fill="none" stroke="#F0A35E" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.35"/>
+  <text x="120" y="146" text-anchor="middle" font-family="Helvetica Neue, Arial, sans-serif" font-size="104" font-weight="800" fill="#F6F4EE" letter-spacing="-4">w<tspan fill="#F0A35E">x</tspan></text>
+</svg>

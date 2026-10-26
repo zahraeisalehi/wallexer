@@ -1,59 +1,75 @@
-#!/bin/sh
-# wallexer one-line install (Linux / macOS):
-#   curl -LsSf https://raw.githubusercontent.com/zahraeisalehi/wallexer/main/install.sh | sh
-# Installs uv if missing, then the `wallexer` command via `uv tool install`. No questions; safe to
-# re-run (it upgrades in place). `wallexer` then opens straight into the public demo (read-only);
-# `wallexer setup` configures your own engine. WALLEXER_SOURCE overrides where it installs from
-# (a git URL or a path); WALLEXER_INSTALL_VERBOSE=1 shows the installers' output.
-set -eu
+#!/usr/bin/env bash
+# wallexer install (Linux / macOS):
+#   curl -fsSL https://raw.githubusercontent.com/zahraeisalehi/wallexer/main/install.sh | bash
+# Checks for uv (installs it if missing) and Python 3.12 (uv provides it if missing), clones the
+# repo (or updates an existing clone), runs `uv sync --frozen`, copies .env.example to .env (never
+# overwrites an existing .env) and puts a `wallexer` command on PATH. Safe to re-run.
+# WALLEXER_DIR overrides the clone location (default ~/wallexer).
+set -euo pipefail
 
-SOURCE="${WALLEXER_SOURCE:-git+https://github.com/zahraeisalehi/wallexer}"
-USER_PATH="$PATH"  # the caller's PATH: decides whether a bare `wallexer` will work there
-LOG="$(mktemp "${TMPDIR:-/tmp}/wallexer-install.XXXXXX")"
-trap 'rm -f "$LOG"' EXIT
+REPO="https://github.com/zahraeisalehi/wallexer.git"
+DIR="${WALLEXER_DIR:-$HOME/wallexer}"
+BIN="$HOME/.local/bin"
+USER_PATH="$PATH"  # the caller's PATH: decides whether a bare `wallexer` works there
 
-fail() {
-  printf 'install.sh: %s\n' "$*" >&2
-  [ -s "$LOG" ] && tail -n 20 "$LOG" >&2
-  exit 1
-}
-quietly() {
-  if [ "${WALLEXER_INSTALL_VERBOSE:-0}" = 1 ]; then "$@"; else "$@" >>"$LOG" 2>&1; fi
-}
+say() { printf '%s\n' "$*"; }
+fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Linux|Darwin) ;;
   *) fail "unsupported OS $(uname -s): Linux and macOS only" ;;
 esac
+command -v git >/dev/null 2>&1 || fail "git is required"
 
-# uv: use an existing one, else the official installer (into ~/.local/bin, quiet).
-if ! command -v uv >/dev/null 2>&1; then
-  for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
-    [ -x "$d/uv" ] && PATH="$d:$PATH" && export PATH
-  done
+# uv
+if ! command -v uv >/dev/null 2>&1 && [ -x "$HOME/.local/bin/uv" ]; then
+  PATH="$HOME/.local/bin:$PATH"
 fi
 if ! command -v uv >/dev/null 2>&1; then
-  UV_PRINT_QUIET=1
-  export UV_PRINT_QUIET
-  if command -v curl >/dev/null 2>&1; then
-    curl -LsSf https://astral.sh/uv/install.sh | quietly sh || fail "uv install failed"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- https://astral.sh/uv/install.sh | quietly sh || fail "uv install failed"
-  else
-    fail "need curl or wget to install uv"
-  fi
+  say "Installing uv (https://astral.sh/uv)…"
+  curl -LsSf https://astral.sh/uv/install.sh | UV_PRINT_QUIET=1 sh
   PATH="$HOME/.local/bin:$PATH"
-  export PATH
 fi
 command -v uv >/dev/null 2>&1 || fail "uv not found after installing it"
+say "uv: $(uv --version)"
 
-# --force + --reinstall-package: re-running upgrades in place (never a stale cached build).
-quietly uv tool install --force --reinstall-package wallexer --python 3.12 "$SOURCE" \
-  || fail "installing wallexer from $SOURCE failed"
+# Python 3.12 (the project pins it in .python-version; uv downloads it if the system has none)
+if ! uv python find 3.12 >/dev/null 2>&1; then
+  say "Python 3.12 not found: installing it with uv…"
+  uv python install 3.12
+fi
+say "python: $(uv python find 3.12)"
 
-BIN="$(uv tool dir --bin 2>/dev/null || printf '%s' "$HOME/.local/bin")"
+# clone or update
+if [ -d "$DIR/.git" ]; then
+  say "Updating $DIR…"
+  git -C "$DIR" pull --ff-only
+else
+  say "Cloning into $DIR…"
+  git clone "$REPO" "$DIR"
+fi
+cd "$DIR"
+uv sync --frozen
+
+# .env from the template, only if there is none yet
+if [ ! -f .env ]; then
+  cp .env.example .env
+  chmod 600 .env
+  say "Created $DIR/.env from .env.example (fill in your keys)."
+fi
+
+# `wallexer` on PATH: a link to the project's own entry point (it uses this checkout and its .env)
+mkdir -p "$BIN"
+ln -sf "$DIR/.venv/bin/wallexer" "$BIN/wallexer"
+
+say ""
+say "wallexer installed in $DIR"
 case ":$USER_PATH:" in
-  *":$BIN:"*) printf 'Run: wallexer\n' ;;
-  *) quietly uv tool update-shell || true
-     printf 'Run: %s/wallexer\n' "$BIN" ;;
+  *":$BIN:"*) ;;
+  *) say "Add $BIN to your PATH first:  export PATH=\"$BIN:\$PATH\"" ;;
 esac
+say "Next:"
+say "  cd $DIR && vim .env      # WALLEX_API_KEY (in single quotes), WALLEX_SUBACCOUNT_ID, BOXAPI_API_KEY, EVENT_END_UTC"
+say "  wallexer doctor          # keys, sub-account, balances, fees, clock"
+say "  wallexer shadowtest      # live data, simulated orders"
+say "  wallexer                 # the full-screen app"

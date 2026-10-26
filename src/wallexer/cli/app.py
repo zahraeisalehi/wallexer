@@ -642,12 +642,36 @@ def sum_cmd(
 @_cmd("export")
 @friendly
 def export() -> None:
-    """Zip decisions, orders, fills, equity, allocations, llm_calls, reports, basis study, dust, config."""
+    """Zip decisions, orders, fills, equity, allocations, llm_calls, reports, explanations, config."""
     from wallexer.cli.results import export as run
 
     settings = load_settings()
+    key = settings.secrets.boxapi_api_key
+    if key and key.get_secret_value():
+        asyncio.run(_backfill(settings))
+    else:
+        console.print(
+            "[muted]no BoxAPI key: explanations.md has only already-stored explanations[/]"
+        )
     basis_md = asyncio.run(_basis_markdown(settings))
     run(settings, console, basis_md)
+
+
+async def _backfill(settings: Any) -> None:
+    from wallexer.cli.logs import backfill_explanations, missing_explanations
+    from wallexer.store.db import init_db
+
+    conn = init_db(settings.cfg.path(settings.cfg.store.db_path))
+    try:
+        todo = len(missing_explanations(conn))
+        if todo:
+            with console.status(f"explaining {todo} decision(s) for explanations.md (LLM)…"):
+                done = await backfill_explanations(
+                    settings, conn, float(settings.cfg.account.expected_equity_tmn)
+                )
+            console.print(f"explained {done} of {todo} decision(s)")
+    finally:
+        conn.close()
 
 
 async def _basis_markdown(settings) -> str | None:

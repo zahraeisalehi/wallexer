@@ -47,6 +47,8 @@ TABLES = (
 
 
 def export(settings: Settings, console: Console, basis_md: str | None) -> str:
+    from wallexer.cli.logs import explanations_markdown
+
     cfg = settings.cfg
     conn = init_db(cfg.path(cfg.store.db_path))
     out = cfg.path(f"data/exports/wallexer-export-{datetime.now(UTC):%Y%m%dT%H%M%S}.zip")
@@ -78,6 +80,7 @@ def export(settings: Settings, console: Console, basis_md: str | None) -> str:
                 z.write(rep, f"reports/{rep.name}")
             if basis_md:
                 z.writestr("reports/basis_study.md", basis_md)
+            z.writestr("explanations.md", explanations_markdown(conn))
             z.write(DEFAULT_CONFIG, "config/default.toml")
             ov = cfg.path(cfg.store.overrides_path)
             if ov.exists():

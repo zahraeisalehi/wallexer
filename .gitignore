@@ -4,7 +4,6 @@ data/*.db*
 data/logs/
 __pycache__/
 *.pyc
-.env
 *.zip
 *.kate-swp
 data/engine_status.json
@@ -12,3 +11,5 @@ data/engine.sock
 data/.repl_history
 data/exports/
 data/research/
+data/overrides.toml
+logs/
